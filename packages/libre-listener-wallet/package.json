@@ -1,0 +1,23 @@
+{
+  "name": "@libre/listener-wallet",
+  "version": "0.1.0",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@libre/shared": "workspace:*",
+    "lightningdevkit": "^0.1.0"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0",
+    "msw": "^2.3.0",
+    "tsup": "^8.0.2",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}

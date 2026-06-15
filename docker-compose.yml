@@ -1,0 +1,87 @@
+version: "3.8"
+
+services:
+  bitcoind:
+    image: lncm/bitcoind:v26.0
+    container_name: libre-bitcoind
+    command: >
+      -regtest=1
+      -rpcallowip=0.0.0.0/0
+      -rpcbind=0.0.0.0
+      -rpcuser=libre
+      -rpcpassword=listener
+      -txindex=1
+      -fallbackfee=0.0002
+      -server=1
+      -zmqpubrawblock=tcp://0.0.0.0:28332
+      -zmqpubrawtx=tcp://0.0.0.0:28333
+      -printtoconsole=1
+    ports:
+      # strictly bound to localhost for security
+      - "127.0.0.1:18443:18443"
+    volumes:
+      - bitcoin-data:/data
+
+  electrs:
+    image: mempool/electrs:latest
+    container_name: libre-electrs
+    user: "root"
+    command: >
+      -v
+      --network regtest
+      --daemon-rpc-addr bitcoind:18443
+      --cookie libre:listener
+      --daemon-dir /data/bitcoind/.bitcoin
+      --db-dir /data/db
+      --http-addr 0.0.0.0:3002
+      --jsonrpc-import
+    ports:
+      # strictly bound to localhost for security
+      - "127.0.0.1:3002:3002"
+    volumes:
+      - bitcoin-data:/data/bitcoind:ro
+      - electrs-db:/data/db
+    depends_on:
+      - bitcoind
+
+  lnd:
+    image: lightninglabs/lnd:v0.18.0-beta
+    container_name: libre-lnd
+    command: >
+      --bitcoin.active
+      --bitcoin.regtest
+      --bitcoin.node=bitcoind
+      --bitcoind.rpchost=bitcoind
+      --bitcoind.rpcuser=libre
+      --bitcoind.rpcpass=listener
+      --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      --rpclisten=0.0.0.0:10009
+      --restlisten=0.0.0.0:8080
+      --listen=0.0.0.0:9735
+      --protocol.zero-conf
+      --protocol.option-scid-alias
+      --debuglevel=info
+    ports:
+      # strictly bound to localhost for security
+      - "127.0.0.1:10009:10009"
+      - "127.0.0.1:8088:8080"
+    volumes:
+      - lnd-data:/root/.lnd
+    depends_on:
+      - bitcoind
+
+  websockify:
+    image: python:3-slim
+    container_name: libre-websockify
+    command: sh -c "pip install websockify && websockify 0.0.0.0:8081 lnd:9735"
+    ports:
+      # strictly bound to localhost for security
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      - lnd
+
+volumes:
+  bitcoin-data:
+  electrs-db:
+  lnd-data:

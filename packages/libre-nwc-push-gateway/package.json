@@ -1,0 +1,19 @@
+{
+  "name": "@libre/nwc-push-gateway",
+  "version": "0.1.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@libre/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.2",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
