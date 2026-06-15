@@ -10,6 +10,14 @@
 
 The **Libre Listener Wallet** is a zero-infrastructure, non-custodial Bitcoin Lightning Network implementation. It is designed to run directly inside browser/PWA sandboxes and native mobile wrappers, bringing friction-free Lightning payments to the Podcasting 2.0 and Value-for-Value (`v4vmusic.com`) music streaming ecosystem.
 
+## Expected User Experience
+
+1.  **Onboarding ("Give me a wallet")**: The user clicks the button. Locally in the browser sandbox, the SDK generates a new BIP39 seed phrase and initializes the LDK WASM client node (state is persisted in IndexedDB). The user now has a fully sovereign wallet with a `0 sat` balance.
+2.  **Funding (First Deposit)**: The user requests an invoice to fund their new wallet. Since they have no open channels, the SDK requests routing hints from a whitelisted LSP (sourced from the `.well-known` providers registry) using the **LSPS2 JIT Channel** protocol.
+3.  **Automatic Liquidity**: The user pays the invoice from an external service (e.g., Strike, Cash App). The LSP intercepts the payment, opens a zero-confirmation channel to the browser node, deducts the channel fee atomically, and routes the remaining balance.
+4.  **Instant Spendability**: The channel is instantly active. The user now has sovereign control of their sats directly in their browser.
+5.  **V4V Streaming & Boostagrams**: When playing a song or podcast, the user clicks "Boost". The browser node constructs a Keysend payment, injects the custom bLIP-10 metadata (TLV record `7629169` for Boost data and `7629175` for the Feed GUID), signs it locally, and routes it instantly.
+
 ## Workspace Packages
 
 The repository is structured as a TypeScript monorepo managed by `pnpm` and Turborepo:
