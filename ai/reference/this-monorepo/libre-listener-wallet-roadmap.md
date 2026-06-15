@@ -63,6 +63,11 @@ This document outlines the step-by-step roadmap to build, test, and release the 
   - *Integration Test:* Trigger a payment from the mock LSP in Docker to the SDK wallet, verify the LSP opens a zero-conf channel, and verify the client receives the remaining sats.
 - [ ] **Tier 2 (LSPS1 Capacity Market):**
   - Build query client to purchase pre-planned inbound/outbound capacity from the whitelisted LSPs via HTTPS APIs.
+- [ ] **Example App Setup (`packages/example-app`):**
+  - Scaffold a Vite-based TypeScript workspace for a demo client application.
+  - Implement dynamic config settings input form (e.g., custom lightning-providers.json path/URL, Esplora URL, Websockify URL) to avoid hardcoding `v4vmusic.com`.
+  - Render an interactive console showing the LDK node's status: sync state, node pubkey, connected peers, and open channels.
+  - Provide a UI form to request incoming LSPS2 JIT invoices and display real-time payment resolution.
 
 ---
 
@@ -77,6 +82,10 @@ This document outlines the step-by-step roadmap to build, test, and release the 
   - Support dynamic custom keys/values (needed for split routing).
 - [ ] **Multi-Recipient Splits:**
   - Build helper logic to split a single payment across multiple destination keysends (e.g., 90% to creator, 10% to app publisher) using the same `boost_uuid`.
+- [ ] **Example App - Audio Player & Micropayments UI:**
+  - Add an audio player component to stream tracks/episodes.
+  - Integrate periodic streaming micropayments (keysends) based on active audio playback.
+  - Add a "Boost" interface enabling the user to send keysend payments with custom messages (Boostagram metadata TLVs).
 
 ---
 
@@ -90,6 +99,9 @@ This document outlines the step-by-step roadmap to build, test, and release the 
   - Listen for encrypted Nostr events requesting wallet info, balance, invoice creation, and keysends.
 - [ ] **Security & Permissions:**
   - Implement spending limits (e.g. max sats per day/transaction) and host app permission whitelisting.
+- [ ] **Example App - NWC Dashboard:**
+  - Build a settings interface for generating, displaying (as text and QR code), and managing active NWC pairing connections.
+  - Allow local wallet authorization, checking transaction histories, and configuring limits directly from the dashboard.
 
 ---
 
@@ -105,3 +117,6 @@ This document outlines the step-by-step roadmap to build, test, and release the 
   - Optimize the LDK boot and sync sequence for rapid startup (must complete under 15 seconds).
 - [ ] **Fallback "Tap to Pay" UX:**
   - If background sync fails or exceeds the OS execution window, fallback to triggering a push notification prompt that opens the PWA when clicked to finalize payment.
+- [ ] **Example App - PWA & Push Service Integration:**
+  - Integrate Service Worker registration and Web Push notifications permission prompt.
+  - Add simulated logs to trace background wake-ups and verify that offline NWC payments trigger push events successfully.
