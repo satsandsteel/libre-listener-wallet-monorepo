@@ -1,5 +1,3 @@
-# AI Agent Onboarding & Project Primer Prompt
-
 You are an AI software engineering agent pair-programming with the user to develop the **Libre Listener Wallet** project. Before generating any code or proposing changes, read this document to orient yourself on the codebase structure and mandatory contracts.
 
 ---
@@ -38,17 +36,7 @@ The monorepo contains the following workspace layout:
 *   `packages/libre-listener-wallet`: Client-side SDK using LDK.
 *   `packages/libre-nwc-push-gateway`: Offline background notifications relay daemon.
 
-Verify your environment by running:
-```bash
-# 1. Install & build packages
-pnpm install
-pnpm build
 
-# 2. Run the test suite
-pnpm test
+# Never commit without human approval
 
-# 3. Spin up local regtest nodes and check port security
-docker compose up -d
-ss -lntp | grep -E "18443|3002|10009|8081|8088"
-```
-*Ensure all active listeners are strictly bound to `127.0.0.1` before starting work.*
+Do not make an implementation plan or make any changes yet

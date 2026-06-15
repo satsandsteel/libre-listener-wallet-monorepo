@@ -36,16 +36,16 @@ This document outlines the step-by-step roadmap to build, test, and release the 
 ## Milestone 2: Core SDK Architecture & WASM Node Engine
 *Goal: Initialize the client-side LDK WASM node and enable state persistence.*
 
-- [ ] **Clean Architecture Interfaces:**
+- [x] **Clean Architecture Interfaces:**
   - Define `SecureStorageProvider` interface (IndexedDB vs. mobile keychain).
   - Define `WebSocketStreamProvider` interface (browser WebSockets vs. mobile TCP).
-- [ ] **LDK Node Wrapper:**
+- [x] **LDK Node Wrapper:**
   - Install `@lightningdevkit/lightningdevkit` (LDK JS bindings).
   - Build the LDK Node manager class responsible for setup, start, and shutdown.
-- [ ] **Chain Sync Integration:**
+- [x] **Chain Sync Integration:**
   - Build the Esplora sync client implementing LDK's `Confirm` and `Filter` interfaces.
   - Verify client can query block headers, transaction inputs, and script filters from Esplora.
-- [ ] **State Persistence & Recovery:**
+- [x] **State Persistence & Recovery:**
   - Implement client state serialization.
   - Verify node can do a "cold boot," save state to IndexedDB, restart, and restore state cleanly.
 
