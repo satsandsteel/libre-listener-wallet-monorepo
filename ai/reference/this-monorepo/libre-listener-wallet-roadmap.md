@@ -74,18 +74,18 @@ This document outlines the step-by-step roadmap to build, test, and release the 
 ## Milestone 4: Value-for-Value Payments (Keysend & TLVs)
 *Goal: Enable streaming micropayments and metadata transmission.*
 
-- [ ] **Keysend Payments API:**
-  - Implement `sendKeysendPayment` wrapper exposing LDK's keysend routing parameters.
-- [ ] **Custom TLV Encoder/Decoder:**
-  - Implement serialization for **TLV Type `7629169`** (bLIP-10 podcast metadata and boostagrams).
-  - Implement serialization for **TLV Type `7629175`** (podcast index ID).
-  - Support dynamic custom keys/values (needed for split routing).
-- [ ] **Multi-Recipient Splits:**
-  - Build helper logic to split a single payment across multiple destination keysends (e.g., 90% to creator, 10% to app publisher) using the same `boost_uuid`.
-- [ ] **Example App - Audio Player & Micropayments UI:**
-  - Add an audio player component to stream tracks/episodes.
-  - Integrate periodic streaming micropayments (keysends) based on active audio playback.
-  - Add a "Boost" interface enabling the user to send keysend payments with custom messages (Boostagram metadata TLVs).
+- [x] **Keysend Payments API:**
+  - [x] Implement `sendKeysendPayment` wrapper exposing LDK's keysend routing parameters.
+- [x] **Custom TLV Encoder/Decoder:**
+  - [x] Implement serialization for **TLV Type `7629169`** (bLIP-10 podcast metadata and boostagrams).
+  - [x] Implement serialization for **TLV Type `7629175`** (podcast index ID).
+  - [x] Support dynamic custom keys/values (needed for split routing).
+- [x] **Multi-Recipient Splits:**
+  - [x] Build helper logic to split a single payment across multiple destination keysends (e.g., 90% to creator, 10% to app publisher) using the same `boost_uuid`.
+- [x] **Example App - Audio Player & Micropayments UI:**
+  - [x] Add an audio player component to stream tracks/episodes.
+  - [x] Integrate periodic streaming micropayments (keysends) based on active audio playback.
+  - [x] Add a "Boost" interface enabling the user to send keysend payments with custom messages (Boostagram metadata TLVs).
 
 ---
 

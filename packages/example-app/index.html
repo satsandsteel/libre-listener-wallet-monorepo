@@ -112,7 +112,62 @@
           </div>
         </section>
 
-        <!-- Section 5: Real-time LDK Console logs -->
+        <!-- Section 5: V4V Audio Player & Streaming -->
+        <section class="card glass-card">
+          <h2>5. V4V Audio & Streaming</h2>
+          <div class="audio-player-container">
+            <audio id="audio-player" controls src="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3" style="width: 100%; margin-bottom: 15px;"></audio>
+          </div>
+          <div class="form-group">
+            <label>Streaming Rate (Sats/Min)</label>
+            <input type="number" id="stream-rate-input" value="60" min="1" />
+          </div>
+          <div class="status-box">
+            <div class="status-line">
+              <span class="label">Stream Mode:</span>
+              <span id="stream-mode-status" class="value text-warning">Inactive</span>
+            </div>
+            <div class="status-line">
+              <span class="label">Sats Streamed:</span>
+              <span id="sats-streamed-val" class="value">0</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section 6: V4V Splits & Boostagram -->
+        <section class="card glass-card">
+          <h2>6. V4V Splits & Boostagram</h2>
+          <div class="form-group">
+            <label>Boost Amount (Satoshi)</label>
+            <input type="number" id="boost-amount" value="500" min="1" />
+          </div>
+          <div class="form-group">
+            <label>Boost Message (Boostagram)</label>
+            <input type="text" id="boost-message" value="Amazing song! Loving the beat." />
+          </div>
+          <div class="form-group">
+            <label>Sender Name</label>
+            <input type="text" id="boost-sender-name" value="Anonymous Listener" />
+          </div>
+
+          <div class="split-destinations-ui">
+            <label>Split Recipients (90% Creator, 10% App Developer)</label>
+            <div class="split-info">
+              <div class="split-row">
+                <span class="dest-pubkey-short">Creator Pubkey: 02bdaf...bfbf24</span>
+                <span class="dest-share">90%</span>
+              </div>
+              <div class="split-row">
+                <span class="dest-pubkey-short">App Dev Pubkey: 035c6e...f185ef</span>
+                <span class="dest-share">10%</span>
+              </div>
+            </div>
+          </div>
+          
+          <button id="send-boostagram-btn" class="btn btn-glow" disabled style="margin-top: 15px;">Send Boostagram</button>
+        </section>
+
+        <!-- Section 7: Real-time LDK Console logs -->
         <section class="card glass-card col-span-full">
           <div class="logs-header">
             <h2>Console Logs</h2>

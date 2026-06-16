@@ -5,7 +5,11 @@ import type {
   Lsps1GetInfoResponse,
   Lsps1CreateOrderParams,
   Lsps1CreateOrderResponse,
+  TlvRecord,
+  SplitResult,
 } from "@libre/shared";
+import { encodeV4VTlvs } from "@libre/shared";
+
 import {
   initializeWasmFromBinary,
   initializeWasmWebFetch,
@@ -71,6 +75,13 @@ import {
   Option_ThirtyTwoBytesZ_Some,
   Event_PaymentClaimable,
   Result_ThirtyTwoBytesNoneZ_OK,
+  PaymentParameters,
+  RouteParameters,
+  Retry,
+  RecipientOnionFields,
+  TwoTuple_u64CVec_u8ZZ,
+  Result_ThirtyTwoBytesRetryableSendFailureZ_OK,
+  Result_RecipientOnionFieldsNoneZ_OK,
 } from "lightningdevkit";
 import { StorageCache, bytesToHex, hexToBytes } from "./storage-cache";
 import { EsploraSyncClient } from "./esplora-client";
@@ -882,6 +893,139 @@ export class LibreListenerWallet {
 
     this.logger?.info(`[LSPS1] Order placed successfully: ${orderRes.order_id}. Pay invoice: ${orderRes.invoice}`);
     return orderRes.invoice;
+  }
+
+  // --- Value-for-Value Keysend & Splits Implementation ---
+
+  async sendKeysendPayment(options: {
+    destinationPubkey: string;
+    amountSats: number;
+    customRecords?: Record<number, string | Uint8Array>;
+    retryAttempts?: number;
+  }): Promise<{ ok: true; paymentId: string; paymentHash: string } | { ok: false; error: string }> {
+    if (!this.isRunning || !this.channelManager) {
+      throw new Error("Wallet is not running");
+    }
+
+    const { destinationPubkey, amountSats, customRecords, retryAttempts } = options;
+    this.logger?.info(`[Keysend] Sending ${amountSats} sats to ${destinationPubkey}...`);
+
+    try {
+      const destPubkeyBytes = hexToBytes(destinationPubkey);
+      const preimage = getSecureRandomBytes(32);
+      const paymentId = getSecureRandomBytes(32);
+
+      const paymentHash = await crypto.subtle.digest("SHA-256", preimage as any);
+      const paymentHashHex = bytesToHex(new Uint8Array(paymentHash));
+
+      // Construct custom TLV records
+      const tlvTuples: TwoTuple_u64CVec_u8ZZ[] = [];
+      if (customRecords) {
+        const sortedKeys = Object.keys(customRecords)
+          .map((k) => parseInt(k, 10))
+          .filter((k) => !isNaN(k))
+          .sort((a, b) => a - b);
+
+        for (const key of sortedKeys) {
+          const val = customRecords[key];
+          const valBytes = typeof val === "string" ? new TextEncoder().encode(val) : val;
+          tlvTuples.push(TwoTuple_u64CVec_u8ZZ.constructor_new(BigInt(key), valBytes));
+        }
+      }
+
+      let onionFields = RecipientOnionFields.constructor_spontaneous_empty();
+      if (tlvTuples.length > 0) {
+        const onionRes = onionFields.with_custom_tlvs(tlvTuples);
+        if (!onionRes.is_ok()) {
+          return { ok: false, error: "Failed to construct custom TLVs on onion fields" };
+        }
+        onionFields = (onionRes as Result_RecipientOnionFieldsNoneZ_OK).res;
+      }
+
+      const paymentParams = PaymentParameters.constructor_for_keysend(
+        destPubkeyBytes,
+        42,
+        false
+      );
+
+      const routeParams = RouteParameters.constructor_from_payment_params_and_value(
+        paymentParams,
+        BigInt(amountSats * 1000)
+      );
+
+      const attempts = retryAttempts ?? 10;
+      const retryStrategy = Retry.constructor_attempts(attempts);
+
+      const sendRes = this.channelManager.send_spontaneous_payment(
+        Option_ThirtyTwoBytesZ.constructor_some(preimage),
+        onionFields,
+        paymentId,
+        routeParams,
+        retryStrategy
+      );
+
+      if (sendRes.is_ok()) {
+        this.logger?.info(`[Keysend] Payment successfully initiated with ID: ${bytesToHex(paymentId)}, hash: ${paymentHashHex}`);
+        // Store the preimage so we can reference it when Event_PaymentClaimable triggers (if we pay ourselves)
+        await this.storage.setItem(`preimage_${paymentHashHex}`, bytesToHex(preimage));
+        return {
+          ok: true,
+          paymentId: bytesToHex(paymentId),
+          paymentHash: paymentHashHex,
+        };
+      } else {
+        const error = (sendRes as any).err?.toString() || "Unknown LDK error";
+        this.logger?.error(`[Keysend] Payment failed to initiate: ${error}`);
+        return {
+          ok: false,
+          error: `Payment failed to initiate: ${error}`,
+        };
+      }
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.logger?.error(`[Keysend] Error during payment generation: ${errMsg}`);
+      return {
+        ok: false,
+        error: errMsg,
+      };
+    }
+  }
+
+  async sendSplitPayments(splits: SplitResult[]): Promise<{
+    ok: boolean;
+    results: Array<{
+      destinationPubkey: string;
+      amountSats: number;
+      result: { ok: true; paymentId: string; paymentHash: string } | { ok: false; error: string };
+    }>;
+  }> {
+    this.logger?.info(`[Keysend] Initiating multi-recipient splits (${splits.length} destinations)...`);
+    const promises = splits.map(async (split) => {
+      const customRecords: Record<number, Uint8Array> = {};
+      for (const rec of split.tlvRecords) {
+        customRecords[rec.key] = rec.value;
+      }
+
+      const res = await this.sendKeysendPayment({
+        destinationPubkey: split.destinationPubkey,
+        amountSats: split.amountSats,
+        customRecords,
+      });
+
+      return {
+        destinationPubkey: split.destinationPubkey,
+        amountSats: split.amountSats,
+        result: res,
+      };
+    });
+
+    const results = await Promise.all(promises);
+    const anyFailed = results.some((r) => !r.result.ok);
+
+    return {
+      ok: !anyFailed,
+      results,
+    };
   }
 }
 

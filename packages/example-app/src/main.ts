@@ -4,6 +4,17 @@ import {
   WebSocketStreamProvider,
   WebSocketConnection,
 } from "@libre/listener-wallet";
+import { calculateSplits } from "@libre/shared";
+
+// Boot MSW browser worker conditionally in development mode to intercept LSP API (9099) requests
+if (import.meta.env.DEV) {
+  const { worker } = await import("./mocks");
+  await worker.start({
+    onUnhandledRequest: "bypass",
+  });
+}
+
+
 
 // 1. Browser websocket connection provider for LDK
 class BrowserWebSocketStreamProvider implements WebSocketStreamProvider {
@@ -127,6 +138,21 @@ const copyLsps1InvoiceBtn = document.getElementById("copy-lsps1-invoice-btn") as
 
 const clearLogsBtn = document.getElementById("clear-logs-btn") as HTMLButtonElement;
 
+// V4V Elements
+const audioPlayer = document.getElementById("audio-player") as HTMLAudioElement;
+const streamRateInput = document.getElementById("stream-rate-input") as HTMLInputElement;
+const streamModeStatus = document.getElementById("stream-mode-status") as HTMLSpanElement;
+const satsStreamedVal = document.getElementById("sats-streamed-val") as HTMLSpanElement;
+
+const boostAmountInput = document.getElementById("boost-amount") as HTMLInputElement;
+const boostMessageInput = document.getElementById("boost-message") as HTMLInputElement;
+const boostSenderName = document.getElementById("boost-sender-name") as HTMLInputElement;
+const sendBoostagramBtn = document.getElementById("send-boostagram-btn") as HTMLButtonElement;
+
+let streamIntervalId: any = null;
+let totalSatsStreamed = 0;
+
+
 // Helper to extract hex node id from byte array
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -221,6 +247,8 @@ startNodeBtn.addEventListener("click", async () => {
     connectLspBtn.disabled = false;
     requestJitBtn.disabled = false;
     purchaseLsps1Btn.disabled = false;
+    sendBoostagramBtn.disabled = false;
+
 
     // Display Node ID
     const mgr = wallet.getChannelManager();
@@ -250,13 +278,27 @@ stopNodeBtn.addEventListener("click", async () => {
     walletStatusBadge.innerText = "Stopped";
     walletStatusBadge.className = "badge badge-status stopped";
     startNodeBtn.disabled = false;
+    stopNodeBtn.disabled = true;
     connectLspBtn.disabled = true;
     requestJitBtn.disabled = true;
     purchaseLsps1Btn.disabled = true;
+    sendBoostagramBtn.disabled = true;
     nodeIdVal.innerText = "-";
     peersCountVal.innerText = "0";
     jitInvoiceContainer.classList.add("hidden");
     lsps1InvoiceContainer.classList.add("hidden");
+
+    // Reset V4V state
+    audioPlayer.pause();
+    if (streamIntervalId) {
+      clearInterval(streamIntervalId);
+      streamIntervalId = null;
+    }
+    streamModeStatus.innerText = "Inactive";
+    streamModeStatus.className = "value text-warning";
+    totalSatsStreamed = 0;
+    satsStreamedVal.innerText = "0";
+
   } catch (err: any) {
     appendLog(`[ERROR] Stop failed: ${err.message}`, "error");
     stopNodeBtn.disabled = false;
@@ -375,3 +417,126 @@ copyLsps1InvoiceBtn.addEventListener("click", () => {
   navigator.clipboard.writeText(lsps1InvoiceStr.value);
   appendLog("[SYSTEM] LSPS1 Invoice copied to clipboard.", "system");
 });
+
+// 11. V4V Audio Streaming Event Listeners
+audioPlayer.addEventListener("play", () => {
+  if (!wallet || !isNodeRunning) {
+    appendLog("[SYSTEM] Start the LDK Node before playing to enable V4V streaming.", "warn");
+    audioPlayer.pause();
+    return;
+  }
+  
+  appendLog("[V4V] Audio playback started. Beginning streaming micropayments...", "system");
+  streamModeStatus.innerText = "Active";
+  streamModeStatus.className = "value text-success";
+  
+  if (streamIntervalId) clearInterval(streamIntervalId);
+  
+  // Send payments every 10 seconds (for testing convenience)
+  streamIntervalId = setInterval(async () => {
+    if (!wallet || !isNodeRunning) {
+      clearInterval(streamIntervalId);
+      return;
+    }
+    
+    const rateSatsMin = parseInt(streamRateInput.value, 10);
+    const amountSats = Math.max(1, Math.round((rateSatsMin * 10) / 60));
+    
+    appendLog(`[V4V] Streaming ${amountSats} sats (interval: 10s)...`, "info");
+    
+    // Creator pubkey and App Dev pubkey
+    const creatorPubkey = "02bdafbf7a60765a9ab4673350c1b5954449e290f498d1ff3a77c58eb7cebfbf24";
+    const appDevPubkey = "035c6ec9ffea21051515efbb72d2fb07dfb51fa16d78772cc1c9b6348981f185ef";
+    
+    const destinations = [
+      { destinationPubkey: creatorPubkey, share: 90 },
+      { destinationPubkey: appDevPubkey, share: 10 },
+    ];
+    
+    const splits = calculateSplits({
+      destinations,
+      amountSats,
+      boostRecordTemplate: {
+        action: "stream",
+        app_name: "v4vmusic-player",
+        ts: Math.floor(audioPlayer.currentTime),
+      },
+    });
+    
+    const res = await wallet.sendSplitPayments(splits);
+    if (res.ok) {
+      totalSatsStreamed += amountSats;
+      satsStreamedVal.innerText = totalSatsStreamed.toString();
+      appendLog(`[V4V] Successfully streamed ${amountSats} sats split!`, "info");
+    } else {
+      appendLog(`[V4V] Failed streaming split payment: some recipients failed. Check LDK logs.`, "error");
+    }
+  }, 10000);
+});
+
+const stopStreaming = () => {
+  if (streamIntervalId) {
+    clearInterval(streamIntervalId);
+    streamIntervalId = null;
+  }
+  streamModeStatus.innerText = "Inactive";
+  streamModeStatus.className = "value text-warning";
+  appendLog("[V4V] Audio playback paused/stopped. Stopped streaming micropayments.", "system");
+};
+
+audioPlayer.addEventListener("pause", stopStreaming);
+audioPlayer.addEventListener("ended", stopStreaming);
+audioPlayer.addEventListener("error", stopStreaming);
+
+// 12. Send Boostagram Splits
+sendBoostagramBtn.addEventListener("click", async () => {
+  if (!wallet || !isNodeRunning) return;
+  try {
+    sendBoostagramBtn.disabled = true;
+    const amountSats = parseInt(boostAmountInput.value, 10);
+    const message = boostMessageInput.value.trim();
+    const senderName = boostSenderName.value.trim();
+    
+    appendLog(`[V4V] Preparing Boostagram of ${amountSats} sats with message: "${message}"...`, "system");
+    
+    const creatorPubkey = "02bdafbf7a60765a9ab4673350c1b5954449e290f498d1ff3a77c58eb7cebfbf24";
+    const appDevPubkey = "035c6ec9ffea21051515efbb72d2fb07dfb51fa16d78772cc1c9b6348981f185ef";
+    
+    const destinations = [
+      { destinationPubkey: creatorPubkey, share: 90 },
+      { destinationPubkey: appDevPubkey, share: 10 },
+    ];
+    
+    const splits = calculateSplits({
+      destinations,
+      amountSats,
+      boostRecordTemplate: {
+        action: "boost",
+        app_name: "v4vmusic-player",
+        message,
+        sender_name: senderName,
+        ts: Math.floor(audioPlayer.currentTime),
+      },
+    });
+    
+    const res = await wallet.sendSplitPayments(splits);
+    if (res.ok) {
+      appendLog(`[V4V] Boostagram sent successfully! Total ${amountSats} sats split:`, "info");
+      for (const r of res.results) {
+        const hash = r.result.ok ? r.result.paymentHash : "N/A";
+        appendLog(` -> ${r.destinationPubkey.substring(0, 8)}... gets ${r.amountSats} sats, status: OK, paymentHash: ${hash}`, "info");
+      }
+    } else {
+      appendLog(`[V4V] Failed to send Boostagram: one or more payments failed.`, "error");
+      for (const r of res.results) {
+        const status = r.result.ok ? "OK" : `Error: ${r.result.error}`;
+        appendLog(` -> ${r.destinationPubkey.substring(0, 8)}... gets ${r.amountSats} sats, status: ${status}`, "error");
+      }
+    }
+  } catch (err: any) {
+    appendLog(`[ERROR] Boostagram sending failed: ${err.message}`, "error");
+  } finally {
+    sendBoostagramBtn.disabled = false;
+  }
+});
+

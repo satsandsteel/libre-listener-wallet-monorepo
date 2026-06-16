@@ -24,6 +24,9 @@ importers:
         specifier: workspace:*
         version: link:../shared
     devDependencies:
+      msw:
+        specifier: ^2.14.6
+        version: 2.14.6(@types/node@25.9.3)(typescript@5.9.3)
       typescript:
         specifier: ^5.4.5
         version: 5.9.3
