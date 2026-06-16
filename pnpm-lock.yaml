@@ -15,6 +15,22 @@ importers:
         specifier: ^5.4.5
         version: 5.9.3
 
+  packages/example-app:
+    dependencies:
+      '@libre/listener-wallet':
+        specifier: workspace:*
+        version: link:../libre-listener-wallet
+      '@libre/shared':
+        specifier: workspace:*
+        version: link:../shared
+    devDependencies:
+      typescript:
+        specifier: ^5.4.5
+        version: 5.9.3
+      vite:
+        specifier: ^5.2.11
+        version: 5.4.21(@types/node@25.9.3)
+
   packages/libre-listener-wallet:
     dependencies:
       '@libre/shared':

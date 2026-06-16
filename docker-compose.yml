@@ -66,6 +66,7 @@ services:
       # strictly bound to localhost for security
       - "127.0.0.1:10009:10009"
       - "127.0.0.1:8088:8080"
+      - "127.0.0.1:9735:9735"
     volumes:
       - lnd-data:/root/.lnd
     depends_on:

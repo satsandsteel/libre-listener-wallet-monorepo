@@ -201,7 +201,7 @@ export class EsploraSyncClient implements FilterInterface {
     // Get current best block in manager
     const managerBestBlock = channelManager.current_best_block();
     let bestHeight = managerBestBlock.get_height();
-    let bestHashHex = bytesToHex(managerBestBlock.get_block_hash());
+    let bestHashHex = bytesToHex(new Uint8Array(managerBestBlock.get_block_hash()).reverse());
 
     this.logger?.info(`Syncing LDK: best height ${bestHeight} (${bestHashHex}) -> tip height ${tipHeight} (${tipHashHex})`);
 

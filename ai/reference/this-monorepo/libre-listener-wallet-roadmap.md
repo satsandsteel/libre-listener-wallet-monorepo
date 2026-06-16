@@ -54,20 +54,20 @@ This document outlines the step-by-step roadmap to build, test, and release the 
 ## Milestone 3: Multi-Tier Liquidity Engine (LSPS1/LSPS2 Onboarding)
 *Goal: Establish channel onboarding for new users with a 0-sat balance.*
 
-- [ ] **LSP Registry Client:**
-  - Implement client fetcher for `.well-known/lightning-providers.json`.
-  - Handle fee-quoting fallback logic across whitelisted LSPs.
-- [ ] **Tier 1 (LSPS2 JIT Channel):**
-  - Build client invoice generator that fetches routing hints and JIT channel params from the LSP.
-  - Verify client can receive incoming payments via Lightning.
-  - *Integration Test:* Trigger a payment from the mock LSP in Docker to the SDK wallet, verify the LSP opens a zero-conf channel, and verify the client receives the remaining sats.
-- [ ] **Tier 2 (LSPS1 Capacity Market):**
-  - Build query client to purchase pre-planned inbound/outbound capacity from the whitelisted LSPs via HTTPS APIs.
-- [ ] **Example App Setup (`packages/example-app`):**
-  - Scaffold a Vite-based TypeScript workspace for a demo client application.
-  - Implement dynamic config settings input form (e.g., custom lightning-providers.json path/URL, Esplora URL, Websockify URL) to avoid hardcoding `v4vmusic.com`.
-  - Render an interactive console showing the LDK node's status: sync state, node pubkey, connected peers, and open channels.
-  - Provide a UI form to request incoming LSPS2 JIT invoices and display real-time payment resolution.
+- [x] **LSP Registry Client:**
+  - [x] Implement client fetcher for `.well-known/lightning-providers.json`.
+  - [x] Handle fee-quoting fallback logic across whitelisted LSPs.
+- [x] **Tier 1 (LSPS2 JIT Channel):**
+  - [x] Build client invoice generator that fetches routing hints and JIT channel params from the LSP.
+  - [x] Verify client can receive incoming payments via Lightning.
+  - [x] *Integration Test:* Trigger a payment from the mock LSP in Docker to the SDK wallet, verify the LSP opens a zero-conf channel, and verify the client receives the remaining sats.
+- [x] **Tier 2 (LSPS1 Capacity Market):**
+  - [x] Build query client to purchase pre-planned inbound/outbound capacity from the whitelisted LSPs via HTTPS APIs.
+- [x] **Example App Setup (`packages/example-app`):**
+  - [x] Scaffold a Vite-based TypeScript workspace for a demo client application.
+  - [x] Implement dynamic config settings input form (e.g., custom lightning-providers.json path/URL, Esplora URL, Websockify URL) to avoid hardcoding `v4vmusic.com`.
+  - [x] Render an interactive console showing the LDK node's status: sync state, node pubkey, connected peers, and open channels.
+  - [x] Provide a UI form to request incoming LSPS2 JIT invoices and display real-time payment resolution.
 
 ---
 

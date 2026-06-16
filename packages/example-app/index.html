@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Libre Listener Client Playground</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div class="glow-container">
+      <div class="glow-orb orb-1"></div>
+      <div class="glow-orb orb-2"></div>
+    </div>
+
+    <div class="app-container">
+      <header class="app-header">
+        <div class="header-main">
+          <h1>🎙️ Libre Listener Client</h1>
+          <div class="badge-row">
+            <span class="badge badge-network">regtest</span>
+            <span id="wallet-status-badge" class="badge badge-status stopped">Stopped</span>
+          </div>
+        </div>
+        <p class="subtitle">Milestone 3: JIT Channel Onboarding & Capacity Playground</p>
+      </header>
+
+      <main class="dashboard-grid">
+        <!-- Section 1: Wallet Control -->
+        <section class="card glass-card">
+          <h2>1. Node Controller</h2>
+          <div class="form-group">
+            <label>LDK Seed (Memory Only)</label>
+            <div class="input-action-row">
+              <input type="password" id="seed-input" value="0000000000000000000000000000000000000000000000000000000000000001" placeholder="Enter 32-byte hex seed" />
+              <button id="toggle-seed-btn" class="btn btn-secondary">Show</button>
+            </div>
+            <p class="help-text">Leave default or input 64-character hex seed.</p>
+          </div>
+
+          <div class="form-group">
+            <label>Esplora (Electrs) Sync URL</label>
+            <input type="text" id="esplora-url-input" value="http://127.0.0.1:3002" />
+          </div>
+
+          <div class="button-row">
+            <button id="start-node-btn" class="btn btn-glow">Start Node</button>
+            <button id="stop-node-btn" class="btn btn-danger" disabled>Stop Node</button>
+          </div>
+
+          <div class="status-box">
+            <div class="status-line">
+              <span class="label">Node ID:</span>
+              <span id="node-id-val" class="value select-all">-</span>
+            </div>
+            <div class="status-line">
+              <span class="label">Peers Connected:</span>
+              <span id="peers-count" class="value">0</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section 2: LSP Connections -->
+        <section class="card glass-card">
+          <h2>2. LSP Peer Connection</h2>
+          <div class="form-group">
+            <label>LSP Connection String (pubkey@host:port)</label>
+            <input type="text" id="lsp-conn-str" value="02bdafbf7a60765a9ab4673350c1b5954449e290f498d1ff3a77c58eb7cebfbf24@127.0.0.1:9735" />
+          </div>
+          <div class="form-group">
+            <label>LSP JSON-RPC HTTP API</label>
+            <input type="text" id="lsp-api-url" value="http://127.0.0.1:9099/lsps2" />
+          </div>
+          <button id="connect-lsp-btn" class="btn btn-primary" disabled>Connect Peer</button>
+        </section>
+
+        <!-- Section 3: LSPS2 JIT Channel -->
+        <section class="card glass-card">
+          <h2>3. LSPS2 JIT Invoice</h2>
+          <div class="form-group">
+            <label>Amount (Satoshi)</label>
+            <input type="number" id="jit-amount" value="20000" min="1000" />
+          </div>
+          <div class="form-group">
+            <label>Memo / Description</label>
+            <input type="text" id="jit-desc" value="JIT Onboarding Playground" />
+          </div>
+          <button id="request-jit-btn" class="btn btn-primary" disabled>Request Invoice</button>
+
+          <div id="jit-invoice-container" class="invoice-container hidden">
+            <label>Generated BOLT11 Invoice</label>
+            <textarea id="jit-invoice-str" readonly rows="4"></textarea>
+            <button id="copy-jit-invoice-btn" class="btn btn-secondary btn-sm">Copy Invoice</button>
+          </div>
+        </section>
+
+        <!-- Section 4: LSPS1 Inbound Capacity -->
+        <section class="card glass-card">
+          <h2>4. LSPS1 Inbound Capacity</h2>
+          <div class="form-group">
+            <label>Requested Channel Balance (Satoshi)</label>
+            <input type="number" id="lsps1-amount" value="100000" min="50000" />
+          </div>
+          <button id="purchase-lsps1-btn" class="btn btn-primary" disabled>Order Capacity</button>
+
+          <div id="lsps1-invoice-container" class="invoice-container hidden">
+            <label>LSP Order Payment Invoice</label>
+            <textarea id="lsps1-invoice-str" readonly rows="4"></textarea>
+            <button id="copy-lsps1-invoice-btn" class="btn btn-secondary btn-sm">Copy Invoice</button>
+          </div>
+        </section>
+
+        <!-- Section 5: Real-time LDK Console logs -->
+        <section class="card glass-card col-span-full">
+          <div class="logs-header">
+            <h2>Console Logs</h2>
+            <div class="log-actions">
+              <select id="log-filter">
+                <option value="all">All Logs</option>
+                <option value="info">Info</option>
+                <option value="warn">Warnings</option>
+                <option value="error">Errors</option>
+              </select>
+              <button id="clear-logs-btn" class="btn btn-secondary btn-sm">Clear</button>
+            </div>
+          </div>
+          <div class="terminal-panel">
+            <div id="terminal-content" class="terminal-content">
+              <div class="log-line system">[SYSTEM] Welcome to Libre Listener Client console. Start the LDK Node to initialize.</div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

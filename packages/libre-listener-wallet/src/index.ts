@@ -1,4 +1,11 @@
-import { WalletConfig } from "@libre/shared";
+import type {
+  WalletConfig,
+  LspProvider,
+  JsonRpcRequest,
+  Lsps1GetInfoResponse,
+  Lsps1CreateOrderParams,
+  Lsps1CreateOrderResponse,
+} from "@libre/shared";
 import {
   initializeWasmFromBinary,
   initializeWasmWebFetch,
@@ -8,7 +15,7 @@ import {
   KVStore,
   MonitorUpdatingPersister,
   ChainMonitor,
-  KeysManager,
+  PhantomKeysManager,
   UserConfig,
   ChainParameters,
   BestBlock,
@@ -34,9 +41,40 @@ import {
   Option_SocketAddressZ,
   Init,
   UtilMethods,
+  PeerManager,
+  IgnoringMessageHandler,
+  SocketDescriptor,
+  SocketDescriptorInterface,
+  Result_CVec_u8ZPeerHandleErrorZ,
+  Result_CVec_u8ZPeerHandleErrorZ_OK,
+  PhantomRouteHints,
+  ChannelDetails,
+  ChannelCounterparty,
+  CounterpartyForwardingInfo,
+  InitFeatures,
+  RouteHint,
+  RouteHintHop,
+  RoutingFees,
+  Option_u64Z,
+  Option_u64Z_Some,
+  Option_u32Z,
+  Option_u16Z,
+  Option_ChannelShutdownStateZ,
+  Option_ThirtyTwoBytesZ,
+  Result_Bolt11InvoiceSignOrCreationErrorZ,
+  Result_Bolt11InvoiceSignOrCreationErrorZ_OK,
+  Currency,
+  ChannelId,
+  Event,
+  EventHandler,
+  Result_NoneReplayEventZ,
+  Option_ThirtyTwoBytesZ_Some,
+  Event_PaymentClaimable,
+  Result_ThirtyTwoBytesNoneZ_OK,
 } from "lightningdevkit";
 import { StorageCache, bytesToHex, hexToBytes } from "./storage-cache";
 import { EsploraSyncClient } from "./esplora-client";
+import { LspsClient } from "./lsps-client";
 
 export interface Logger {
   info(message: string, ...args: any[]): void;
@@ -74,6 +112,49 @@ function getSecureRandomBytes(len: number): Uint8Array {
   return bytes;
 }
 
+export class WebSocketDescriptor implements SocketDescriptorInterface {
+  id: number;
+  connection: WebSocketConnection;
+  wallet: LibreListenerWallet;
+  peerPubkey: string;
+  isClosed: boolean = false;
+
+  constructor(id: number, connection: WebSocketConnection, wallet: LibreListenerWallet, peerPubkey: string) {
+    this.id = id;
+    this.connection = connection;
+    this.wallet = wallet;
+    this.peerPubkey = peerPubkey;
+  }
+
+  send_data(data: Uint8Array, resume_read: boolean): number {
+    if (this.isClosed) return 0;
+    try {
+      this.connection.send(data);
+      return data.length;
+    } catch (e) {
+      this.disconnect_socket();
+      return 0;
+    }
+  }
+
+  disconnect_socket(): void {
+    if (this.isClosed) return;
+    this.isClosed = true;
+    try {
+      this.connection.close();
+    } catch (e) {}
+    this.wallet.handleDisconnect(this);
+  }
+
+  eq(other: SocketDescriptor): boolean {
+    return other.hash() === BigInt(this.id);
+  }
+
+  hash(): bigint {
+    return BigInt(this.id);
+  }
+}
+
 export class LibreListenerWallet {
   private config: WalletConfig;
   private logger?: Logger;
@@ -86,14 +167,23 @@ export class LibreListenerWallet {
 
   private storageCache?: StorageCache;
   private syncClient?: EsploraSyncClient;
-  private keysManager?: KeysManager;
+  private keysManager?: PhantomKeysManager;
   private chainMonitor?: ChainMonitor;
   private channelManager?: ChannelManager;
   private networkGraph?: NetworkGraph;
   private scorer?: ProbabilisticScorer;
   private lockableScore?: MultiThreadedLockableScore;
   private monitorUpdatingPersister?: MonitorUpdatingPersister;
+  private peerManager?: PeerManager;
+  private ldkLogger?: LdkLogger;
+
   private syncIntervalId?: any;
+  private peerTickIntervalId?: any;
+  private eventTickIntervalId?: any;
+  private nextDescriptorId: number = 1;
+  private connectedPeers: Map<string, WebSocketDescriptor> = new Map(); // hex pubkey -> descriptor
+  private registryCache?: LspProvider[];
+  private eventListeners: ((event: Event) => void)[] = [];
 
   constructor(options: {
     config: WalletConfig;
@@ -137,7 +227,7 @@ export class LibreListenerWallet {
 
     const kvStore = KVStore.new_impl(this.storageCache);
 
-    // 3. Setup key derivation & KeysManager
+    // 3. Setup key derivation & PhantomKeysManager
     let seedHex = await this.storage.getItem("ldk_seed");
     let seed: Uint8Array;
     if (!seedHex) {
@@ -147,10 +237,11 @@ export class LibreListenerWallet {
     } else {
       seed = hexToBytes(seedHex);
     }
-    this.keysManager = KeysManager.constructor_new(
+    this.keysManager = PhantomKeysManager.constructor_new(
       seed,
       BigInt(Math.floor(Date.now() / 1000)),
-      Math.floor(Math.random() * 100000)
+      Math.floor(Math.random() * 100000),
+      seed // cross_node_seed matches the seed
     );
 
     // 4. Setup Esplora sync client
@@ -158,7 +249,7 @@ export class LibreListenerWallet {
 
     // 5. Instantiate LDK Logger, FeeEstimator, Broadcaster
     const self = this;
-    const ldkLogger = LdkLogger.new_impl({
+    this.ldkLogger = LdkLogger.new_impl({
       log(record) {
         const level = record.get_level();
         const args = record.get_args();
@@ -176,11 +267,14 @@ export class LibreListenerWallet {
             self.logger?.info(message);
             break;
           case Level.LDKLevel_Debug:
+            self.logger?.info(`[DEBUG] ${message}`);
+            break;
           case Level.LDKLevel_Trace:
+            self.logger?.info(`[TRACE] ${message}`);
+            break;
           case Level.LDKLevel_Gossip:
           default:
-            // Optional debug logging, can map to info/debug
-            self.logger?.info(message);
+            // Suppress verbose gossip in logs unless needed
             break;
         }
       }
@@ -205,7 +299,7 @@ export class LibreListenerWallet {
     // 6. Setup MonitorUpdatingPersister & ChainMonitor
     this.monitorUpdatingPersister = MonitorUpdatingPersister.constructor_new(
       kvStore,
-      ldkLogger,
+      this.ldkLogger,
       BigInt(10),
       this.keysManager.as_EntropySource(),
       this.keysManager.as_SignerProvider(),
@@ -217,7 +311,7 @@ export class LibreListenerWallet {
     this.chainMonitor = ChainMonitor.constructor_new(
       Option_FilterZ.constructor_some(Filter.new_impl(this.syncClient)),
       broadcaster,
-      ldkLogger,
+      this.ldkLogger,
       feeEstimator,
       monitorPersister
     );
@@ -252,14 +346,14 @@ export class LibreListenerWallet {
 
     const graphHex = await this.storage.getItem("network_graph");
     if (graphHex) {
-      const readRes = NetworkGraph.constructor_read(hexToBytes(graphHex), ldkLogger);
+      const readRes = NetworkGraph.constructor_read(hexToBytes(graphHex), this.ldkLogger);
       if (readRes.is_ok()) {
         this.networkGraph = (readRes as Result_NetworkGraphDecodeErrorZ_OK).res;
         this.logger?.info("Loaded NetworkGraph from storage");
       }
     }
     if (!this.networkGraph) {
-      this.networkGraph = NetworkGraph.constructor_new(ldkNetwork, ldkLogger);
+      this.networkGraph = NetworkGraph.constructor_new(ldkNetwork, this.ldkLogger);
       this.logger?.info("Created new NetworkGraph");
     }
 
@@ -269,7 +363,7 @@ export class LibreListenerWallet {
         hexToBytes(scorerHex),
         ProbabilisticScoringDecayParameters.constructor_default(),
         this.networkGraph,
-        ldkLogger
+        this.ldkLogger
       );
       if (readRes.is_ok()) {
         this.scorer = (readRes as Result_ProbabilisticScorerDecodeErrorZ_OK).res;
@@ -280,7 +374,7 @@ export class LibreListenerWallet {
       this.scorer = ProbabilisticScorer.constructor_new(
         ProbabilisticScoringDecayParameters.constructor_default(),
         this.networkGraph,
-        ldkLogger
+        this.ldkLogger
       );
       this.logger?.info("Created new Scorer");
     }
@@ -290,7 +384,7 @@ export class LibreListenerWallet {
     // 9. Setup Router and MessageRouter
     const router = DefaultRouter.constructor_new(
       this.networkGraph,
-      ldkLogger,
+      this.ldkLogger,
       this.keysManager.as_EntropySource(),
       this.lockableScore.as_LockableScore(),
       ProbabilisticScoringFeeParameters.constructor_default()
@@ -302,6 +396,10 @@ export class LibreListenerWallet {
     );
 
     // 10. Load or construct ChannelManager
+    const userConfig = UserConfig.constructor_default();
+    userConfig.set_manually_accept_inbound_channels(true);
+    userConfig.get_channel_handshake_config().set_negotiate_anchors_zero_fee_htlc_tx(true);
+
     const managerHex = await this.storage.getItem("channel_manager");
     if (managerHex) {
       const readRes = UtilMethods.constructor_C2Tuple_ThirtyTwoBytesChannelManagerZ_read(
@@ -314,8 +412,8 @@ export class LibreListenerWallet {
         broadcaster,
         router.as_Router(),
         msgRouter.as_MessageRouter(),
-        ldkLogger,
-        UserConfig.constructor_default(),
+        this.ldkLogger,
+        userConfig,
         channelMonitors
       );
 
@@ -331,7 +429,7 @@ export class LibreListenerWallet {
     if (!this.channelManager) {
       const tipHeight = await this.syncClient.fetchTipHeight();
       const tipHashHex = await this.syncClient.fetchTipHash();
-      const tipHash = hexToBytes(tipHashHex);
+      const tipHash = hexToBytes(tipHashHex).reverse();
 
       const bestBlock = BestBlock.constructor_new(tipHash, tipHeight);
       const params = ChainParameters.constructor_new(ldkNetwork, bestBlock);
@@ -342,21 +440,34 @@ export class LibreListenerWallet {
         broadcaster,
         router.as_Router(),
         msgRouter.as_MessageRouter(),
-        ldkLogger,
+        this.ldkLogger,
         this.keysManager.as_EntropySource(),
         this.keysManager.as_NodeSigner(),
         this.keysManager.as_SignerProvider(),
-        UserConfig.constructor_default(),
+        userConfig,
         params,
         Math.floor(Date.now() / 1000)
       );
       this.logger?.info("Successfully bootstrapped a fresh ChannelManager");
     }
 
-    // 11. Initial sync with Esplora
+    // 11. Setup PeerManager
+    const ignoringHandler = IgnoringMessageHandler.constructor_new();
+    this.peerManager = PeerManager.constructor_new(
+      this.channelManager.as_ChannelMessageHandler(),
+      ignoringHandler.as_RoutingMessageHandler(),
+      ignoringHandler.as_OnionMessageHandler(),
+      ignoringHandler.as_CustomMessageHandler(),
+      Math.floor(Date.now() / 1000),
+      getSecureRandomBytes(32),
+      this.ldkLogger,
+      this.keysManager.as_NodeSigner()
+    );
+
+    // 12. Initial sync with Esplora
     await this.syncClient.sync(this.channelManager, this.chainMonitor);
 
-    // 12. Setup background sync loop
+    // 13. Setup background loops
     this.syncIntervalId = setInterval(() => {
       if (this.channelManager && this.chainMonitor) {
         this.syncClient!.sync(this.channelManager, this.chainMonitor).catch(err => {
@@ -364,6 +475,75 @@ export class LibreListenerWallet {
         });
       }
     }, 30000);
+
+    this.peerTickIntervalId = setInterval(() => {
+      if (this.peerManager) {
+        this.peerManager.timer_tick_occurred();
+        this.peerManager.process_events();
+      }
+    }, 10000);
+
+    const eventHandler = EventHandler.new_impl({
+      handle_event: (event: Event) => {
+        const name = event.constructor.name;
+        this.logger?.info(`[LDK Event] Received event: ${name}`);
+
+        for (const listener of this.eventListeners) {
+          try {
+            listener(event);
+          } catch (e) {
+            this.logger?.error(`Error in event listener: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+
+        if (event instanceof Event_PaymentClaimable) {
+          const paymentHash = bytesToHex(event.payment_hash);
+          this.logger?.info(`[LDK Event] PaymentClaimable for hash: ${paymentHash}`);
+          this.storage.getItem(`preimage_${paymentHash}`).then((preimageHex) => {
+            if (preimageHex) {
+              this.logger?.info(`[LDK Event] Claiming payment with preimage: ${preimageHex}`);
+              this.channelManager!.claim_funds(hexToBytes(preimageHex));
+            } else {
+              const preimageOpt = event.purpose.preimage();
+              if (preimageOpt instanceof Option_ThirtyTwoBytesZ_Some) {
+                this.logger?.info(`[LDK Event] Claiming payment with preimage from purpose: ${bytesToHex(preimageOpt.some)}`);
+                this.channelManager!.claim_funds(preimageOpt.some);
+              } else {
+                this.logger?.warn(`[LDK Event] Preimage unknown for hash: ${paymentHash}`);
+              }
+            }
+          });
+        } else if (name === "Event_OpenChannelRequest") {
+          this.logger?.info("[LDK Event] OpenChannelRequest received. Accepting zero-conf...");
+          const res = this.channelManager!.accept_inbound_channel_from_trusted_peer_0conf(
+            (event as any).temporary_channel_id,
+            (event as any).counterparty_node_id,
+            0n
+          );
+          this.logger?.info(`[LDK Event] accept_inbound_channel_from_trusted_peer_0conf result: ${res.is_ok()}`);
+        } else if (name === "Event_PendingHTLCsForwardable") {
+          this.logger?.info("[LDK Event] PendingHTLCsForwardable received. Processing forwards...");
+          this.channelManager!.process_pending_htlc_forwards();
+        } else if (name === "Event_ChannelPending") {
+          this.logger?.info(`[LDK Event] Channel pending!`);
+        } else if (name === "Event_ChannelReady") {
+          this.logger?.info(`[LDK Event] Channel ready!`);
+        } else if (name === "Event_PaymentClaimed") {
+          this.logger?.info(`[LDK Event] Payment claimed!`);
+        }
+
+        return Result_NoneReplayEventZ.constructor_ok();
+      }
+    });
+
+    this.eventTickIntervalId = setInterval(() => {
+      if (this.channelManager) {
+        this.channelManager.as_EventsProvider().process_pending_events(eventHandler);
+      }
+      if (this.chainMonitor) {
+        this.chainMonitor.as_EventsProvider().process_pending_events(eventHandler);
+      }
+    }, 1000);
 
     this.isRunning = true;
   }
@@ -379,6 +559,22 @@ export class LibreListenerWallet {
       clearInterval(this.syncIntervalId);
       this.syncIntervalId = undefined;
     }
+
+    if (this.peerTickIntervalId) {
+      clearInterval(this.peerTickIntervalId);
+      this.peerTickIntervalId = undefined;
+    }
+
+    if (this.eventTickIntervalId) {
+      clearInterval(this.eventTickIntervalId);
+      this.eventTickIntervalId = undefined;
+    }
+
+    // Disconnect peers
+    for (const descriptor of this.connectedPeers.values()) {
+      descriptor.disconnect_socket();
+    }
+    this.connectedPeers.clear();
 
     // Persist final states
     if (this.channelManager && this.networkGraph && this.scorer) {
@@ -405,6 +601,8 @@ export class LibreListenerWallet {
     this.scorer = undefined;
     this.lockableScore = undefined;
     this.monitorUpdatingPersister = undefined;
+    this.peerManager = undefined;
+    this.ldkLogger = undefined;
 
     this.isRunning = false;
   }
@@ -420,8 +618,16 @@ export class LibreListenerWallet {
     return this.isRunning ? "Running" : "Stopped";
   }
 
-  // --- Exposed internal objects for Milestone 3+ use ---
-  
+  // --- exposed properties & methods ---
+
+  addEventListener(listener: (event: Event) => void): void {
+    this.eventListeners.push(listener);
+  }
+
+  removeEventListener(listener: (event: Event) => void): void {
+    this.eventListeners = this.eventListeners.filter(l => l !== listener);
+  }
+
   getChannelManager(): ChannelManager | undefined {
     return this.channelManager;
   }
@@ -434,10 +640,252 @@ export class LibreListenerWallet {
     return this.syncClient;
   }
 
-  getKeysManager(): KeysManager | undefined {
+  getKeysManager(): PhantomKeysManager | undefined {
     return this.keysManager;
   }
+
+  getPeerManager(): PeerManager | undefined {
+    return this.peerManager;
+  }
+
+  getConnectedPeers(): string[] {
+    return Array.from(this.connectedPeers.keys());
+  }
+
+  // --- Peer Connection Adapter ---
+
+  async connectPeer(pubkey: string, host: string, port: number): Promise<void> {
+    if (!this.peerManager) {
+      throw new Error("Wallet is not running");
+    }
+
+    this.logger?.info(`Connecting to peer: ${pubkey}@${host}:${port}`);
+
+    // If already connected, do nothing
+    if (this.connectedPeers.has(pubkey)) {
+      this.logger?.info(`Peer ${pubkey} is already connected`);
+      return;
+    }
+
+    const connection = await this.socketProvider.connect(host, port);
+    const descriptorId = this.nextDescriptorId++;
+    const descriptorImpl = new WebSocketDescriptor(descriptorId, connection, this, pubkey);
+    const descriptor = SocketDescriptor.new_impl(descriptorImpl);
+
+    connection.onmessage = (data) => {
+      if (this.peerManager) {
+        const res = this.peerManager.read_event(descriptor, data);
+        if (res.is_ok()) {
+          const bytes = (res as Result_CVec_u8ZPeerHandleErrorZ_OK).res;
+          if (bytes.length > 0) {
+            descriptorImpl.send_data(bytes, false);
+          }
+        } else {
+          this.logger?.error(`Failed to read event for peer ${pubkey}, disconnecting`);
+          descriptorImpl.disconnect_socket();
+        }
+        this.peerManager.process_events();
+      }
+    };
+
+    connection.onclose = () => {
+      descriptorImpl.disconnect_socket();
+    };
+
+    connection.onerror = (err) => {
+      this.logger?.error(`WebSocket error for peer ${pubkey}: ${err.message}`);
+      descriptorImpl.disconnect_socket();
+    };
+
+    const initialBytesResult = this.peerManager.new_outbound_connection(
+      hexToBytes(pubkey),
+      descriptor,
+      Option_SocketAddressZ.constructor_none()
+    );
+
+    if (initialBytesResult.is_ok()) {
+      const initialBytes = (initialBytesResult as Result_CVec_u8ZPeerHandleErrorZ_OK).res;
+      descriptorImpl.send_data(initialBytes, false);
+      this.connectedPeers.set(pubkey, descriptorImpl);
+      this.logger?.info(`Successfully connected to peer: ${pubkey}`);
+    } else {
+      descriptorImpl.disconnect_socket();
+      throw new Error("Failed to initialize outbound connection in PeerManager");
+    }
+  }
+
+  handleDisconnect(desc: WebSocketDescriptor): void {
+    if (this.connectedPeers.get(desc.peerPubkey)?.id === desc.id) {
+      this.connectedPeers.delete(desc.peerPubkey);
+      this.logger?.info(`Disconnected peer: ${desc.peerPubkey}`);
+    }
+    if (this.peerManager) {
+      const sdkDescriptor = SocketDescriptor.new_impl(desc);
+      this.peerManager.socket_disconnected(sdkDescriptor);
+      this.peerManager.process_events();
+    }
+  }
+
+  // --- LSP Discovery Client ---
+
+  async fetchLspRegistry(url: string): Promise<LspProvider[]> {
+    try {
+      this.logger?.info(`Fetching LSP registry from: ${url}`);
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`Failed to fetch LSP registry: ${res.statusText}`);
+      }
+      const data = await res.json() as LspProvider[];
+      this.registryCache = data;
+      return data;
+    } catch (e) {
+      this.logger?.error(`Failed to fetch LSP registry: ${e instanceof Error ? e.message : e}`);
+      if (this.registryCache) {
+        this.logger?.info("Using cached LSP registry");
+        return this.registryCache;
+      }
+      throw e;
+    }
+  }
+
+  // --- LSPS2 JIT Channel Implementation ---
+
+  async requestLSPS2Invoice(options: {
+    amountSats: number;
+    description: string;
+    lsp: LspProvider;
+  }): Promise<string> {
+    if (!this.channelManager || !this.keysManager || !this.peerManager || !this.ldkLogger) {
+      throw new Error("Wallet is not running");
+    }
+
+    const { amountSats, description, lsp } = options;
+    const amountMsat = BigInt(amountSats * 1000);
+
+    this.logger?.info(`[LSPS2] Requesting JIT invoice for ${amountSats} sats from LSP ${lsp.name}`);
+
+    // 1. Connect to LSP peer if not connected
+    const lspConnString = lsp.connection_string; // format: pubkey@host:port
+    const [pubkey, addressPort] = lspConnString.split("@");
+    const [host, portStr] = addressPort.split(":");
+    const port = parseInt(portStr, 10);
+
+    await this.connectPeer(pubkey, host, port);
+
+    // 2. Query LSPS2 API
+    const lspsClient = new LspsClient(lsp.api_url, this.logger);
+
+    // a. Get versions
+    const versionRes = await lspsClient.request<{}, { versions: number[] }>(
+      "lsps2.get_versions",
+      {}
+    );
+    if (!versionRes.versions.includes(1)) {
+      throw new Error("LSP does not support LSPS2 version 1");
+    }
+
+    // b. Get info
+    const infoRes = await lspsClient.request<
+      { version: number; client_node_id: string },
+      { opening_fee_params_menu: any[]; min_payment_size_msat: string; max_payment_size_msat: string }
+    >("lsps2.get_info", {
+      version: 1,
+      client_node_id: bytesToHex(this.channelManager.get_our_node_id()),
+    });
+
+    if (!infoRes.opening_fee_params_menu || infoRes.opening_fee_params_menu.length === 0) {
+      throw new Error("LSP LSPS2 opening fee params menu is empty");
+    }
+
+    // Select the first fee param menu item as default
+    const selectedFeeParams = infoRes.opening_fee_params_menu[0];
+
+    // c. Register JIT Payment with LSP (lsps2.buy)
+    const preimage = getSecureRandomBytes(32);
+    const paymentHash = await crypto.subtle.digest("SHA-256", preimage as any);
+    const paymentHashHex = bytesToHex(new Uint8Array(paymentHash));
+
+    const buyRes = await lspsClient.request<
+      { version: number; opening_fee_params: any; payment_hash: string; client_node_id: string },
+      { jit_channel_scid: string; cltv_expiry_delta: number }
+    >("lsps2.buy", {
+      version: 1,
+      opening_fee_params: selectedFeeParams,
+      payment_hash: paymentHashHex,
+      client_node_id: bytesToHex(this.channelManager.get_our_node_id()),
+    });
+
+    // 3. Generate BOLT11 Invoice using standard ChannelManager creator
+    // This signs with the real node's key and automatically adds route hints for the active zero-conf channel
+    const invoiceRes = UtilMethods.constructor_create_invoice_from_channelmanager_with_payment_hash(
+      this.channelManager,
+      Option_u64Z.constructor_some(amountMsat),
+      description,
+      3600, // expiry seconds
+      hexToBytes(paymentHashHex),
+      Option_u16Z.constructor_some(42)
+    );
+
+    if (!invoiceRes.is_ok()) {
+      throw new Error("Failed to create BOLT11 invoice using channel manager");
+    }
+
+    const invoiceObj = (invoiceRes as Result_Bolt11InvoiceSignOrCreationErrorZ_OK).res;
+    const invoiceStr = invoiceObj.to_str();
+
+    this.logger?.info(`[LSPS2] Generated standard JIT invoice: ${invoiceStr}`);
+
+    // Persist invoice preimage/hash mapping if needed for claims
+    await this.storage.setItem(`preimage_${paymentHashHex}`, bytesToHex(preimage));
+
+    return invoiceStr;
+  }
+
+  // --- LSPS1 Inbound Capacity Purchase ---
+
+  async purchaseLSPS1Capacity(options: {
+    amountSats: number;
+    lsp: LspProvider;
+  }): Promise<string> {
+    if (!this.channelManager) {
+      throw new Error("Wallet is not running");
+    }
+
+    const { amountSats, lsp } = options;
+    this.logger?.info(`[LSPS1] Purchasing ${amountSats} sats inbound capacity from LSP ${lsp.name}`);
+
+    const lspsClient = new LspsClient(lsp.api_url, this.logger);
+
+    // a. Get info
+    const infoRes = await lspsClient.request<{}, Lsps1GetInfoResponse>(
+      "lsps1.get_info",
+      {}
+    );
+
+    const amountSatStr = amountSats.toString();
+    if (BigInt(amountSatStr) < BigInt(infoRes.min_channel_balance_sat) ||
+        BigInt(amountSatStr) > BigInt(infoRes.max_channel_balance_sat)) {
+      throw new Error(`Requested amount ${amountSats} sat is outside LSP bounds [${infoRes.min_channel_balance_sat}, ${infoRes.max_channel_balance_sat}]`);
+    }
+
+    // b. Create order
+    const orderRes = await lspsClient.request<Lsps1CreateOrderParams, Lsps1CreateOrderResponse>(
+      "lsps1.create_order",
+      {
+        lsp_balance_sat: amountSatStr,
+        client_balance_sat: "0",
+        client_node_id: bytesToHex(this.channelManager.get_our_node_id()),
+        channel_expiry_blocks: infoRes.min_channel_expiry_blocks,
+        announce_channel: false,
+      }
+    );
+
+    this.logger?.info(`[LSPS1] Order placed successfully: ${orderRes.order_id}. Pay invoice: ${orderRes.invoice}`);
+    return orderRes.invoice;
+  }
 }
+
 export { StorageCache, bytesToHex, hexToBytes } from "./storage-cache";
 export { EsploraSyncClient } from "./esplora-client";
-export { WalletConfig } from "@libre/shared";
+export type { WalletConfig } from "@libre/shared";
+export { LspsClient } from "./lsps-client";

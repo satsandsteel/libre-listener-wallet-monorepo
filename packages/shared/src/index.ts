@@ -17,3 +17,98 @@ export interface NWCResponse {
   };
   result?: Record<string, any>;
 }
+
+export interface LspProvider {
+  name: string;
+  pubkey: string;
+  connection_string: string;
+  api_url: string;
+  protocols: ("lsps1" | "lsps2")[];
+}
+
+// JSON-RPC Generic Request/Response
+export interface JsonRpcRequest<T = any> {
+  jsonrpc: "2.0";
+  id: string | number;
+  method: string;
+  params: T;
+}
+
+export interface JsonRpcResponse<T = any> {
+  jsonrpc: "2.0";
+  id: string | number;
+  result?: T;
+  error?: {
+    code: number;
+    message: string;
+    data?: any;
+  };
+}
+
+// LSPS2 JIT Channel interfaces
+export interface Lsps2GetVersionsResponse {
+  versions: number[];
+}
+
+export interface Lsps2OpeningFeeParams {
+  opening_fee_params_id: string;
+  min_fee_msat: string;
+  proportional_fee_ppm: number;
+  min_lifetime_blocks: number;
+  cltv_expiry_delta: number;
+  valid_until: string;
+}
+
+export interface Lsps2GetInfoParams {
+  version: number;
+  client_node_id: string;
+}
+
+export interface Lsps2GetInfoResponse {
+  opening_fee_params_menu: Lsps2OpeningFeeParams[];
+  min_payment_size_msat: string;
+  max_payment_size_msat: string;
+}
+
+export interface Lsps2BuyParams {
+  version: number;
+  opening_fee_params: Lsps2OpeningFeeParams;
+  payment_hash: string;
+  client_node_id: string;
+}
+
+export interface Lsps2BuyResponse {
+  jit_channel_scid: string;
+  lsp_node_id: string;
+  client_node_id: string;
+  payment_size_msat: string;
+  cltv_expiry_delta: number;
+}
+
+// LSPS1 Inbound capacity interfaces
+export interface Lsps1GetInfoResponse {
+  min_channel_balance_sat: string;
+  max_channel_balance_sat: string;
+  min_initial_client_balance_sat: string;
+  max_initial_client_balance_sat: string;
+  min_channel_expiry_blocks: number;
+  max_channel_expiry_blocks: number;
+}
+
+export interface Lsps1CreateOrderParams {
+  lsp_balance_sat: string;
+  client_balance_sat: string;
+  client_node_id: string;
+  channel_expiry_blocks: number;
+  announce_channel: boolean;
+}
+
+export interface Lsps1CreateOrderResponse {
+  order_id: string;
+  lsp_balance_sat: string;
+  client_balance_sat: string;
+  payment_value_msat: string;
+  payment_addr: string;
+  invoice: string;
+}
+
