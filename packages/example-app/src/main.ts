@@ -149,6 +149,17 @@ const boostMessageInput = document.getElementById("boost-message") as HTMLInputE
 const boostSenderName = document.getElementById("boost-sender-name") as HTMLInputElement;
 const sendBoostagramBtn = document.getElementById("send-boostagram-btn") as HTMLButtonElement;
 
+// NWC Elements
+const createNwcBtn = document.getElementById("create-nwc-btn") as HTMLButtonElement;
+const nwcConnNameInput = document.getElementById("nwc-conn-name") as HTMLInputElement;
+const nwcSpendingLimitInput = document.getElementById("nwc-spending-limit") as HTMLInputElement;
+const nwcRelayUrlInput = document.getElementById("nwc-relay-url") as HTMLInputElement;
+const nwcUriContainer = document.getElementById("nwc-uri-container") as HTMLDivElement;
+const nwcUriStr = document.getElementById("nwc-uri-str") as HTMLTextAreaElement;
+const copyNwcUriBtn = document.getElementById("copy-nwc-uri-btn") as HTMLButtonElement;
+const nwcQrImg = document.getElementById("nwc-qr-img") as HTMLImageElement;
+const nwcConnectionsList = document.getElementById("nwc-connections-list") as HTMLDivElement;
+
 let streamIntervalId: any = null;
 let totalSatsStreamed = 0;
 
@@ -248,6 +259,8 @@ startNodeBtn.addEventListener("click", async () => {
     requestJitBtn.disabled = false;
     purchaseLsps1Btn.disabled = false;
     sendBoostagramBtn.disabled = false;
+    createNwcBtn.disabled = false;
+    await updateNwcConnectionsList();
 
 
     // Display Node ID
@@ -283,6 +296,9 @@ stopNodeBtn.addEventListener("click", async () => {
     requestJitBtn.disabled = true;
     purchaseLsps1Btn.disabled = true;
     sendBoostagramBtn.disabled = true;
+    createNwcBtn.disabled = true;
+    nwcUriContainer.classList.add("hidden");
+    nwcConnectionsList.innerHTML = '<div class="empty-list-text text-muted" style="font-size: 0.85rem;">No active pairings yet.</div>';
     nodeIdVal.innerText = "-";
     peersCountVal.innerText = "0";
     jitInvoiceContainer.classList.add("hidden");
@@ -539,4 +555,116 @@ sendBoostagramBtn.addEventListener("click", async () => {
     sendBoostagramBtn.disabled = false;
   }
 });
+
+// 13. Nostr Wallet Connect (NWC) Event Listeners & Helpers
+createNwcBtn.addEventListener("click", async () => {
+  if (!wallet || !isNodeRunning) return;
+  try {
+    createNwcBtn.disabled = true;
+    nwcUriContainer.classList.add("hidden");
+    nwcQrImg.classList.add("hidden");
+
+    const name = nwcConnNameInput.value.trim() || "Nostr Client App";
+    const limit = parseInt(nwcSpendingLimitInput.value, 10) || 0;
+    const relayUrl = nwcRelayUrlInput.value.trim() || "wss://relay.damus.io";
+
+    appendLog(`[NWC] Creating connection pairing: "${name}" with limit: ${limit} sats on relay ${relayUrl}...`, "system");
+    const uri = await wallet.nwc.createConnection(name, {
+      spendingLimitSats: limit,
+      relayUrl,
+    });
+
+    appendLog(`[NWC] Connection created successfully!`, "system");
+    nwcUriStr.value = uri;
+    nwcQrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(uri)}`;
+    nwcQrImg.classList.remove("hidden");
+    nwcUriContainer.classList.remove("hidden");
+
+    await updateNwcConnectionsList();
+  } catch (err: any) {
+    appendLog(`[ERROR] NWC connection creation failed: ${err.message}`, "error");
+  } finally {
+    createNwcBtn.disabled = false;
+  }
+});
+
+copyNwcUriBtn.addEventListener("click", () => {
+  if (!nwcUriStr.value) return;
+  navigator.clipboard.writeText(nwcUriStr.value);
+  appendLog("[SYSTEM] NWC Connection URI copied to clipboard.", "system");
+});
+
+async function updateNwcConnectionsList() {
+  if (!wallet) return;
+  try {
+    const list = await wallet.nwc.listConnections();
+    nwcConnectionsList.innerHTML = "";
+
+    if (list.length === 0) {
+      nwcConnectionsList.innerHTML = '<div class="empty-list-text text-muted" style="font-size: 0.85rem;">No active pairings yet.</div>';
+      return;
+    }
+
+    for (const conn of list) {
+      const item = document.createElement("div");
+      item.className = "connection-item";
+
+      const details = document.createElement("div");
+      details.className = "connection-details";
+
+      const nameEl = document.createElement("div");
+      nameEl.className = "connection-name";
+      nameEl.innerText = conn.name;
+
+      const metaEl = document.createElement("div");
+      metaEl.className = "connection-meta";
+
+      const pubkeyEl = document.createElement("span");
+      pubkeyEl.className = "connection-pubkey";
+      pubkeyEl.innerText = `${conn.clientPubkey.substring(0, 8)}...`;
+      pubkeyEl.title = conn.clientPubkey;
+
+      const limitEl = document.createElement("span");
+      limitEl.className = "connection-limit";
+      const limitStr = conn.spendingLimitSats > 0 
+        ? `Limit: ${conn.spentTodaySats}/${conn.spendingLimitSats} sats`
+        : "Limit: Unlimited";
+      limitEl.innerText = limitStr;
+
+      const relayEl = document.createElement("span");
+      relayEl.className = "connection-relay";
+      relayEl.innerText = `Relay: ${conn.relayUrl}`;
+
+      metaEl.appendChild(pubkeyEl);
+      metaEl.appendChild(limitEl);
+      metaEl.appendChild(relayEl);
+
+      details.appendChild(nameEl);
+      details.appendChild(metaEl);
+
+      const revokeBtn = document.createElement("button");
+      revokeBtn.className = "btn-revoke";
+      revokeBtn.innerText = "Revoke";
+      revokeBtn.addEventListener("click", async () => {
+        try {
+          revokeBtn.disabled = true;
+          appendLog(`[NWC] Revoking connection for ${conn.name}...`, "system");
+          await wallet!.nwc.deleteConnection(conn.clientPubkey);
+          appendLog(`[NWC] Connection revoked.`, "system");
+          await updateNwcConnectionsList();
+        } catch (e: any) {
+          appendLog(`[ERROR] Failed to revoke connection: ${e.message}`, "error");
+          revokeBtn.disabled = false;
+        }
+      });
+
+      item.appendChild(details);
+      item.appendChild(revokeBtn);
+      nwcConnectionsList.appendChild(item);
+    }
+  } catch (err: any) {
+    console.error("Failed to update connections list", err);
+  }
+}
+
 

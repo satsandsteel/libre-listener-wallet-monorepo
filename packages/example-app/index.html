@@ -167,7 +167,43 @@
           <button id="send-boostagram-btn" class="btn btn-glow" disabled style="margin-top: 15px;">Send Boostagram</button>
         </section>
 
-        <!-- Section 7: Real-time LDK Console logs -->
+        <!-- Section 7: Nostr Wallet Connect (NWC) -->
+        <section class="card glass-card">
+          <h2>7. Nostr Wallet Connect (NWC)</h2>
+          <div class="form-group">
+            <label>Connection Name</label>
+            <input type="text" id="nwc-conn-name" value="Nostr Client App" placeholder="e.g. Damus, Amethyst" />
+          </div>
+          <div class="form-group">
+            <label>Daily Spending Limit (Sats)</label>
+            <input type="number" id="nwc-spending-limit" value="5000" min="0" placeholder="0 for unlimited" />
+          </div>
+          <div class="form-group">
+            <label>Nostr Relay URL</label>
+            <input type="text" id="nwc-relay-url" value="wss://relay.damus.io" />
+          </div>
+          <button id="create-nwc-btn" class="btn btn-glow" disabled>Create Pairing</button>
+
+          <div id="nwc-uri-container" class="invoice-container hidden">
+            <label>NWC Connection URI</label>
+            <textarea id="nwc-uri-str" readonly rows="3" style="font-size: 0.8rem;"></textarea>
+            <div class="button-row">
+              <button id="copy-nwc-uri-btn" class="btn btn-secondary btn-sm">Copy URI</button>
+            </div>
+            <div class="qr-code-wrapper" style="text-align: center; margin-top: 10px;">
+              <img id="nwc-qr-img" src="" alt="NWC QR Code" class="hidden" style="max-width: 150px; border-radius: var(--radius-sm); border: 2px solid var(--border-color); padding: 5px; background: white;" />
+            </div>
+          </div>
+
+          <div class="nwc-connections-list-wrapper" style="margin-top: 20px; border-top: 1px dashed var(--border-color); padding-top: 15px;">
+            <label>Active Connections</label>
+            <div id="nwc-connections-list" class="connections-list" style="margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
+              <div class="empty-list-text text-muted" style="font-size: 0.85rem;">No active pairings yet.</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section 8: Real-time LDK Console logs -->
         <section class="card glass-card col-span-full">
           <div class="logs-header">
             <h2>Console Logs</h2>

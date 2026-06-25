@@ -86,6 +86,7 @@ import {
 import { StorageCache, bytesToHex, hexToBytes } from "./storage-cache";
 import { EsploraSyncClient } from "./esplora-client";
 import { LspsClient } from "./lsps-client";
+import { NwcManager } from "./nwc-manager";
 
 export interface Logger {
   info(message: string, ...args: any[]): void;
@@ -195,6 +196,7 @@ export class LibreListenerWallet {
   private connectedPeers: Map<string, WebSocketDescriptor> = new Map(); // hex pubkey -> descriptor
   private registryCache?: LspProvider[];
   private eventListeners: ((event: Event) => void)[] = [];
+  public nwc: NwcManager;
 
   constructor(options: {
     config: WalletConfig;
@@ -210,6 +212,7 @@ export class LibreListenerWallet {
     this.logger = options.logger;
     this.wasmBinary = options.wasmBinary;
     this.wasmUrl = options.wasmUrl;
+    this.nwc = new NwcManager(this);
   }
 
   async start(): Promise<void> {
@@ -557,6 +560,10 @@ export class LibreListenerWallet {
     }, 1000);
 
     this.isRunning = true;
+
+    // Initialize and start Nostr Wallet Connect listeners
+    await this.nwc.init();
+    await this.nwc.start();
   }
 
   async stop(): Promise<void> {
@@ -565,6 +572,9 @@ export class LibreListenerWallet {
       return;
     }
     this.logger?.info("Stopping LDK Node...");
+
+    // Stop Nostr Wallet Connect listeners
+    await this.nwc.stop();
 
     if (this.syncIntervalId) {
       clearInterval(this.syncIntervalId);

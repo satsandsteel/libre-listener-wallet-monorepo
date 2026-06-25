@@ -92,16 +92,16 @@ This document outlines the step-by-step roadmap to build, test, and release the 
 ## Milestone 5: Nostr Wallet Connect (NWC / NIP-47) Portability
 *Goal: Allow users to control their wallet from external music/podcast apps while the PWA is open.*
 
-- [ ] **Pairing URI Generator:**
-  - Implement pairing generation creating the `nostr+walletconnect://` string.
-- [ ] **Nostr Relay Listener (NIP-47):**
-  - Integrate `nostr-tools`.
-  - Listen for encrypted Nostr events requesting wallet info, balance, invoice creation, and keysends.
-- [ ] **Security & Permissions:**
-  - Implement spending limits (e.g. max sats per day/transaction) and host app permission whitelisting.
-- [ ] **Example App - NWC Dashboard:**
-  - Build a settings interface for generating, displaying (as text and QR code), and managing active NWC pairing connections.
-  - Allow local wallet authorization, checking transaction histories, and configuring limits directly from the dashboard.
+- [x] **Pairing URI Generator:**
+  - [x] Implement pairing generation creating the `nostr+walletconnect://` string.
+- [x] **Nostr Relay Listener (NIP-47):**
+  - [x] Integrate `nostr-tools`.
+  - [x] Listen for encrypted Nostr events requesting wallet info, balance, invoice creation, and keysends.
+- [x] **Security & Permissions:**
+  - [x] Implement spending limits (e.g. max sats per day/transaction) and host app permission whitelisting.
+- [x] **Example App - NWC Dashboard:**
+  - [x] Build a settings interface for generating, displaying (as text and QR code), and managing active NWC pairing connections.
+  - [x] Allow local wallet authorization, checking transaction histories, and configuring limits directly from the dashboard.
 
 ---
 

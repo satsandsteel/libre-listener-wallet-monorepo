@@ -8,6 +8,9 @@
     "build": "tsup",
     "dev": "tsup --watch"
   },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
   "devDependencies": {
     "tsup": "^8.0.2",
     "typescript": "^5.4.5"
