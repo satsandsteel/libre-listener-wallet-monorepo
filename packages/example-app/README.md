@@ -8,7 +8,7 @@ This is a browser-native developer playground designed to test and demonstrate t
 
 * **Browser-WASM Execution:** The wallet's private keys, seed, and channel states remain 100% inside your browser's execution context.
 * **WebSocket Bridge:** LDK communicates over TCP, but browsers can only open WebSockets. The app connects to the LSP node via a `websockify` bridge container running locally.
-* **Storage Cache:** Wallet states and channels are persisted in browser `localStorage` to test recovering state during cold boots.
+* **Storage Cache:** Wallet states and channels are persisted in browser **IndexedDB** (using `IndexedDBStorageProvider`) to test recovering state and to share the node state with the background Service Worker.
 
 ---
 
@@ -70,6 +70,26 @@ Open the local URL (usually `http://localhost:5173`) in your web browser.
 2. Click **Order Capacity**.
 3. The client calls `lsps1.create_order` to lease a channel from the LSP.
 4. An invoice representing the channel lease setup fee is generated and displayed. Paying this invoice using LND CLI triggers the LSP to open the requested inbound channel to your node.
+
+### Step 5: Configure Nostr Wallet Connect (NWC)
+1. In the **Nostr Wallet Connect card**, enter a connection name, daily spending limit, and Nostr relay URL.
+2. Click **Create Pairing** to generate an NWC URI. The connection details are saved and listed.
+3. This creates a pairing that external applications can use to query your wallet balance or send payments.
+
+### Step 6: Test Web Push Offline Wakeups
+1. **Start the Push Gateway Daemon** from the monorepo root:
+   ```bash
+   pnpm --filter @libre/nwc-push-gateway dev
+   ```
+2. In the **Web Push Offline Wakeups card**, ensure the gateway URL matches `http://127.0.0.1:3001`.
+3. Click **Enable Push Notifications** (and accept the browser notification permission prompt). The status will update to `Registered`.
+4. **Simulate Offline Flow**:
+   * Click **Stop Node** in the Node Controller card (this stops LDK and puts the current browser page node offline).
+   * Click **Trigger Offline NWC Request** in the Web Push card.
+   * This publishes an encrypted NWC balance check event to the Nostr relay on behalf of a simulated client.
+   * The `libre-nwc-push-gateway` detects the request on the Nostr relay and pushes a notification to the browser.
+   * The browser's background Service Worker receives the push event, boots the LDK node silently, syncs block updates from Esplora, decrypts/executes the NWC query, returns the encrypted response to the relay, and shuts down cleanly.
+   * Review the browser Service Worker logs to inspect this background processing. If the background process fails or times out, the Service Worker displays a fallback notification prompting you to tap and open the app.
 
 ---
 

@@ -108,15 +108,15 @@ This document outlines the step-by-step roadmap to build, test, and release the 
 ## Milestone 6: Offline Background Wake-Ups (Libre NWC Push Gateway)
 *Goal: Allow NWC payments to succeed even if the PWA is closed.*
 
-- [ ] **Libre NWC Push Gateway Microservice:**
+- [x] **Libre NWC Push Gateway Microservice:**
   - Build `libre-nwc-push-gateway` as a standalone Node.js app using SQLite/Postgres.
   - Implement Nostr relay listener to track encrypted requests for offline clients.
   - Implement Web Push API triggers.
-- [ ] **PWA Service Worker integration:**
+- [x] **PWA Service Worker integration:**
   - Configure the PWA Service Worker to handle the `push` event.
   - Optimize the LDK boot and sync sequence for rapid startup (must complete under 15 seconds).
-- [ ] **Fallback "Tap to Pay" UX:**
+- [x] **Fallback "Tap to Pay" UX:**
   - If background sync fails or exceeds the OS execution window, fallback to triggering a push notification prompt that opens the PWA when clicked to finalize payment.
-- [ ] **Example App - PWA & Push Service Integration:**
+- [x] **Example App - PWA & Push Service Integration:**
   - Integrate Service Worker registration and Web Push notifications permission prompt.
   - Add simulated logs to trace background wake-ups and verify that offline NWC payments trigger push events successfully.

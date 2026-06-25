@@ -87,6 +87,9 @@ import { StorageCache, bytesToHex, hexToBytes } from "./storage-cache";
 import { EsploraSyncClient } from "./esplora-client";
 import { LspsClient } from "./lsps-client";
 import { NwcManager } from "./nwc-manager";
+import { IndexedDBStorageProvider } from "./indexed-db-storage";
+
+export { IndexedDBStorageProvider };
 
 export interface Logger {
   info(message: string, ...args: any[]): void;

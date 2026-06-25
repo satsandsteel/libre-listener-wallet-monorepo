@@ -1,0 +1,68 @@
+import { SecureStorageProvider } from "./index";
+
+export class IndexedDBStorageProvider implements SecureStorageProvider {
+  private dbName: string;
+  private storeName: string;
+  private db: IDBDatabase | null = null;
+
+  constructor(dbName = "libre-wallet", storeName = "settings") {
+    this.dbName = dbName;
+    this.storeName = storeName;
+  }
+
+  private async getDB(): Promise<IDBDatabase> {
+    if (this.db) return this.db;
+    return new Promise((resolve, reject) => {
+      if (typeof indexedDB === "undefined") {
+        reject(new Error("indexedDB is not defined in this environment"));
+        return;
+      }
+      const request = indexedDB.open(this.dbName, 1);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore(this.storeName);
+      };
+      request.onsuccess = () => {
+        this.db = request.result;
+        resolve(this.db);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async getItem(key: string): Promise<string | null> {
+    try {
+      const db = await this.getDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(this.storeName, "readonly");
+        const store = tx.objectStore(this.storeName);
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result !== undefined ? req.result : null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async setItem(key: string, value: string): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, "readwrite");
+      const store = tx.objectStore(this.storeName);
+      const req = store.put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async removeItem(key: string): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, "readwrite");
+      const store = tx.objectStore(this.storeName);
+      const req = store.delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+}

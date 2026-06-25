@@ -12,6 +12,16 @@ function copyLdkWasmPlugin() {
         fs.mkdirSync(publicDir, { recursive: true });
       }
 
+      // Run tsup to compile the service worker
+      try {
+        console.log("[vite-plugin] Compiling Service Worker with tsup...");
+        const { execSync } = require("child_process");
+        execSync("npx tsup", { cwd: __dirname });
+        console.log("[vite-plugin] Service Worker compiled successfully!");
+      } catch (err: any) {
+        console.error("[vite-plugin] Service Worker compilation failed:", err.message || err);
+      }
+
       // Try multiple potential paths to resolve the WASM in pnpm monorepo
       const candidatePaths = [
         path.resolve(__dirname, "node_modules/lightningdevkit/liblightningjs.wasm"),

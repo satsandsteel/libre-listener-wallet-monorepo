@@ -9,10 +9,12 @@
   },
   "dependencies": {
     "@libre/listener-wallet": "workspace:*",
-    "@libre/shared": "workspace:*"
+    "@libre/shared": "workspace:*",
+    "nostr-tools": "^2.7.2"
   },
   "devDependencies": {
     "msw": "^2.14.6",
+    "tsup": "^8.0.2",
     "typescript": "^5.4.5",
     "vite": "^5.2.11"
   }

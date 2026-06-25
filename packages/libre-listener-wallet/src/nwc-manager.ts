@@ -53,9 +53,32 @@ export class NwcManager {
   private walletPubkey?: string;
   private pendingPayments: Map<string, { resolve: (preimage: string) => void; reject: (err: Error) => void }> = new Map();
   private active: boolean = false;
+  private requestListeners: ((result: { eventId: string; method: string; success: boolean; error?: string }) => void)[] = [];
 
   constructor(wallet: LibreListenerWallet) {
     this.wallet = wallet;
+  }
+
+  getWalletPubkey(): string | undefined {
+    return this.walletPubkey;
+  }
+
+  onRequestProcessed(listener: (result: { eventId: string; method: string; success: boolean; error?: string }) => void) {
+    this.requestListeners.push(listener);
+  }
+
+  offRequestProcessed(listener: (result: { eventId: string; method: string; success: boolean; error?: string }) => void) {
+    this.requestListeners = this.requestListeners.filter(l => l !== listener);
+  }
+
+  private notifyRequestProcessed(eventId: string, method: string, success: boolean, error?: string) {
+    for (const listener of this.requestListeners) {
+      try {
+        listener({ eventId, method, success, error });
+      } catch (e) {
+        this.wallet["logger"]?.error(`Error in NwcManager request listener: ${e}`);
+      }
+    }
   }
 
   async init(): Promise<void> {
@@ -537,6 +560,7 @@ export class NwcManager {
     }, hexToBytes(this.walletPrivKeyHex!));
 
     await relay.publish(event);
+    this.notifyRequestProcessed(requestEvent.id, resultType, true);
   }
 
   private async sendErrorResponse(
@@ -571,5 +595,6 @@ export class NwcManager {
     }, hexToBytes(this.walletPrivKeyHex!));
 
     await relay.publish(event);
+    this.notifyRequestProcessed(requestEvent.id, "", false, message);
   }
 }

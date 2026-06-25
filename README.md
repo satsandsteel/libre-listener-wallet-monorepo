@@ -22,16 +22,17 @@ The **Libre Listener Wallet** is a zero-infrastructure, non-custodial Bitcoin Li
 
 The repository is structured as a TypeScript monorepo managed by `pnpm` and Turborepo:
 
-*   **[`packages/shared`](ai/prompts/primer-prompt.md)**: Common types, request schemas, and serializations shared between the SDK and push gateway.
-*   **[`packages/libre-listener-wallet`](ai/prompts/primer-prompt.md)**: The client-side SDK wrapping LDK (Lightning Development Kit) WASM and native C/Rust bindings.
-*   **[`packages/libre-nwc-push-gateway`](ai/prompts/primer-prompt.md)**: The server-side, stateless notification gateway used to wake up offline PWAs for Nostr Wallet Connect (NWC) requests.
+*   **[`packages/shared`](packages/shared)**: Common types, request schemas, and serializations shared between the SDK and push gateway.
+*   **[`packages/libre-listener-wallet`](packages/libre-listener-wallet)**: The client-side SDK wrapping LDK (Lightning Development Kit) WASM. Now includes `IndexedDBStorageProvider` for context-isolated state sharing.
+*   **[`packages/libre-nwc-push-gateway`](packages/libre-nwc-push-gateway)**: The server-side, stateless notification gateway used to wake up offline PWAs for Nostr Wallet Connect (NWC) requests. Exposes Express endpoints and manages Nostr relay listener subscriptions backed by SQLite.
+*   **[`packages/example-app`](packages/example-app)**: A Vite-based PWA client playground demonstrating JIT channel opens, keysend audio splits, NWC dashboard pairing, and Web Push offline wakeups.
 
 ---
 
 ## Developer & AI Agent Orientation
 
 If you are a developer or an AI coding assistant working on this codebase:
-*   Read the project contracts and design roadmap located in the [**`ai/`**](ai/prompts/primer-prompt.md) directory.
+*   Read the project contracts and design roadmap located in the [**`ai/`**](ai/reference/this-monorepo/libre-listener-wallet-roadmap.md) directory.
 *   Refer to the [**`ai/prompts/primer-prompt.md`**](ai/prompts/primer-prompt.md) onboarding prompt to understand critical security constraints, port configurations, and testing rules.
 
 ---
@@ -57,3 +58,16 @@ Runs local integration testing services (`bitcoind`, `electrs` indexer, `lnd` mo
 docker compose up -d
 ```
 All ports are bound strictly to `127.0.0.1` for local safety.
+
+### 4. Run the Push Gateway Daemon
+Starts the offline background notifications relay daemon on port `3001`:
+```bash
+pnpm --filter @libre/nwc-push-gateway dev
+```
+
+### 5. Run the PWA Example Client
+Starts the Vite development server for the interactive dashboard:
+```bash
+pnpm --filter @libre/example-app dev
+```
+Open `http://localhost:5173` in your browser. Start the node, connect to the LSP node, configure NWC pairings, and enable Web Push notifications to test offline background wake-ups.

@@ -202,8 +202,32 @@
             </div>
           </div>
         </section>
+ 
+        <!-- Section 8: Web Push Offline Wakeups -->
+        <section class="card glass-card">
+          <h2>8. Web Push Offline Wakeups</h2>
+          <div class="form-group">
+            <label>Push Gateway URL</label>
+            <input type="text" id="push-gateway-url" value="http://127.0.0.1:3001" />
+          </div>
+          <div class="button-row">
+            <button id="register-push-btn" class="btn btn-glow">Enable Push Notifications</button>
+            <button id="unregister-push-btn" class="btn btn-danger" disabled>Disable Push</button>
+          </div>
+          <div class="status-box" style="margin-top: 15px;">
+            <div class="status-line">
+              <span class="label">Push Status:</span>
+              <span id="push-status-val" class="value text-warning">Not Registered</span>
+            </div>
+          </div>
+          <div style="border-top: 1px dashed var(--border-color); margin-top: 15px; padding-top: 15px;">
+            <label>Simulate Offline Wake-Up</label>
+            <p class="help-text" style="margin-bottom: 10px;">Simulates an NWC payment request when PWA is closed.</p>
+            <button id="simulate-offline-push-btn" class="btn btn-primary" style="width: 100%;">Trigger Offline NWC Request</button>
+          </div>
+        </section>
 
-        <!-- Section 8: Real-time LDK Console logs -->
+        <!-- Section 9: Real-time LDK Console logs -->
         <section class="card glass-card col-span-full">
           <div class="logs-header">
             <h2>Console Logs</h2>

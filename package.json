@@ -16,5 +16,10 @@
     "workerDirectory": [
       "packages/example-app/public"
     ]
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
   }
 }
