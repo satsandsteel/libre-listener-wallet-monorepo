@@ -3,8 +3,19 @@ import {
   SecureStorageProvider,
   WebSocketStreamProvider,
   WebSocketConnection,
+  seedHexToMnemonic,
 } from "@libre/listener-wallet";
-import { calculateSplits } from "@libre/shared";
+import { resolveSeedInput } from "./core/seed-input";
+import { parsePositiveIntSats } from "./core/amount-input";
+import { LSPS1_REST_PROVIDERS, bridgeTargetUrl, mempoolTxUrl, channelConfLabel, lsps1OrderStatus, zeroConfTrustedPubkeys, isChannelStateRegressionError, isNodeAlreadyRunningError, acquireWebNodeLock, nodeLockName } from "@libre/shared";
+import {
+  formatOpeningFee,
+  validateAmountForProvider,
+  suggestProviderForAmount,
+  providerSummary,
+  isLeaseOptionAvailable,
+  clampLeaseSelectionValue,
+} from "./core/lsps1-provider-ui";
 
 // Boot MSW browser worker conditionally in development mode to intercept LSP API (9099) requests
 if (import.meta.env.DEV) {
@@ -19,11 +30,13 @@ if (import.meta.env.DEV) {
 // 1. Browser websocket connection provider for LDK
 class BrowserWebSocketStreamProvider implements WebSocketStreamProvider {
   async connect(address: string, port: number): Promise<WebSocketConnection> {
-    // Bridge browser WebSocket to LND TCP port 9735 via websockify at 127.0.0.1:8081
-    const wsUrl = "ws://127.0.0.1:8081";
+    // Bridge browser WebSocket to LND TCP port 9735 via websockify at 127.0.0.1:8091
+    const wsUrl =
+      (document.getElementById("ws-bridge-url") as HTMLInputElement | null)?.value?.trim() ||
+      "ws://127.0.0.1:8091";
     appendLog(`[SYSTEM] Connecting WebSocket bridge to ${wsUrl} (LND peer at ${address}:${port})...`, "system");
     
-    const socket = new WebSocket(wsUrl);
+    const socket = new WebSocket(bridgeTargetUrl(wsUrl, address, port));
     socket.binaryType = "arraybuffer";
 
     const conn: WebSocketConnection = {
@@ -64,60 +77,224 @@ class BrowserWebSocketStreamProvider implements WebSocketStreamProvider {
 
 // 2. Browser IndexedDB storage implementation for LDK settings
 import { IndexedDBStorageProvider } from "@libre/listener-wallet";
-const storage = new IndexedDBStorageProvider();
+import * as drive from "./drive-backup";
+import { appendLog, initLogControls } from "./core/logger";
+import { copyToClipboard } from "./core/ui-helpers";
+import type { AppContext } from "./core/app-context";
+import { initWebPush } from "./web-push";
+import { initNwcUi, setNwcEnabled, updateNwcConnectionsList } from "./nwc-ui";
+import { initV4V, setV4VEnabled } from "./v4v";
+import { ensurePersistentStorage } from "./core/persistent-storage";
+import { dbNameForNetwork, migrateStorage, META_DB_NAME, ACTIVE_NETWORK_KEY } from "./core/storage-namespace";
+import { rgsUrlForNetwork } from "./core/rgs-config";
+import { driveButtonView, shouldArmGestureReconnect } from "./core/drive-ui";
+import { assessStartReadiness } from "./core/wallet-readiness";
+import { addressToScriptPubKey } from "./core/address-script";
+let storage!: IndexedDBStorageProvider; // assigned in the init IIFE via refreshWalletForNetwork
+
+// Persist the active network to the meta DB so off-page code (SW, simulate-offline)
+// can open the correct network-scoped DB without reading the main app's state.
+async function setActiveNetwork(network: string): Promise<void> {
+  await new IndexedDBStorageProvider(META_DB_NAME).setItem(ACTIVE_NETWORK_KEY, network);
+}
 
 // 3. Logger helper to update UI terminal console
-const terminalContent = document.getElementById("terminal-content") as HTMLDivElement;
-const logFilter = document.getElementById("log-filter") as HTMLSelectElement;
-
-function appendLog(msg: string, type: "info" | "warn" | "error" | "system" | "ldk-info" | "ldk-debug" | "ldk-trace") {
-  const line = document.createElement("div");
-  line.className = `log-line ${type}`;
-  line.innerText = msg;
-  terminalContent.appendChild(line);
-  
-  // Keep scrolling to the bottom
-  terminalContent.parentElement!.scrollTop = terminalContent.parentElement!.scrollHeight;
-
-  // Filter visibility based on current selection
-  applyLogFilter();
-}
-
-function applyLogFilter() {
-  const filter = logFilter.value;
-  const lines = terminalContent.querySelectorAll(".log-line");
-  lines.forEach((lineNode) => {
-    const el = lineNode as HTMLDivElement;
-    if (filter === "all") {
-      el.style.display = "block";
-    } else if (filter === "error" && el.classList.contains("error")) {
-      el.style.display = "block";
-    } else if (filter === "warn" && el.classList.contains("warn")) {
-      el.style.display = "block";
-    } else if (filter === "info" && (el.classList.contains("info") || el.classList.contains("system") || el.classList.contains("ldk-info"))) {
-      el.style.display = "block";
-    } else {
-      el.style.display = "none";
-    }
-  });
-}
-
 // 4. Wallet Lifecycle State
 let wallet: LibreListenerWallet | null = null;
 let isNodeRunning = false;
+// Seed shown to the user but not yet created (Create New Wallet → Create Wallet).
+let pendingSeed: string | null = null;
+// Set when a wallet was just created, so the next start runs the backup check.
+let justCreated = false;
+// 5s poll handle for the balance/channels view while the node runs.
+let walletViewTimer: any = null;
+// Set when the wallet is auto-started on page load, so the start handler knows to
+// also auto-connect the peer once the node is running.
+let autoConnectMode = false;
+
+// Live accessors handed to feature modules (see core/app-context.ts).
+const ctx: AppContext = { getWallet: () => wallet, isRunning: () => isNodeRunning };
 
 // DOM Elements
 const startNodeBtn = document.getElementById("start-node-btn") as HTMLButtonElement;
 const stopNodeBtn = document.getElementById("stop-node-btn") as HTMLButtonElement;
+const autostartCheckbox = document.getElementById("autostart-checkbox") as HTMLInputElement;
 const walletStatusBadge = document.getElementById("wallet-status-badge") as HTMLSpanElement;
 const seedInput = document.getElementById("seed-input") as HTMLInputElement;
 const toggleSeedBtn = document.getElementById("toggle-seed-btn") as HTMLButtonElement;
+const showPhraseBtn = document.getElementById("show-phrase-btn") as HTMLButtonElement;
+const seedPhraseBox = document.getElementById("seed-phrase-box") as HTMLDivElement;
+const seedPhraseWords = document.getElementById("seed-phrase-words") as HTMLTextAreaElement;
+const copyPhraseBtn = document.getElementById("copy-phrase-btn") as HTMLButtonElement;
+const copySeedBtn = document.getElementById("copy-seed-btn") as HTMLButtonElement;
 const esploraUrlInput = document.getElementById("esplora-url-input") as HTMLInputElement;
-const nodeIdVal = document.getElementById("node-id-val") as HTMLSpanElement;
-const peersCountVal = document.getElementById("peers-count") as HTMLSpanElement;
-
+const networkSelect = document.getElementById("network-select") as HTMLSelectElement;
+const networkBadge = document.getElementById("network-badge") as HTMLSpanElement;
+function updateNetworkBadge() { networkBadge.textContent = networkSelect.value; }
+updateNetworkBadge();
+const wsBridgeUrlInput = document.getElementById("ws-bridge-url") as HTMLInputElement;
 const lspConnStrInput = document.getElementById("lsp-conn-str") as HTMLInputElement;
 const lspApiUrlInput = document.getElementById("lsp-api-url") as HTMLInputElement;
+const nodeIdVal = document.getElementById("node-id-val") as HTMLSpanElement;
+const copyNodeIdBtn = document.getElementById("copy-node-id-btn") as HTMLButtonElement;
+const restoreBanner = document.getElementById("restore-banner") as HTMLDivElement;
+const balanceSpendableEl = document.getElementById("balance-spendable") as HTMLSpanElement;
+const balanceReceivableEl = document.getElementById("balance-receivable") as HTMLSpanElement;
+const channelsCountEl = document.getElementById("channels-count") as HTMLSpanElement;
+const channelsListEl = document.getElementById("channels-list") as HTMLDivElement;
+const gossipStatusEl = document.getElementById("gossip-status") as HTMLSpanElement;
+const syncGossipBtn = document.getElementById("sync-gossip-btn") as HTMLButtonElement;
+
+// Per-network defaults: switching the Network selector auto-fills sync/bridge/peer fields.
+const NETWORK_PRESETS: Record<string, { esplora: string; bridge: string; peer: string }> = {
+  regtest: {
+    esplora: "http://127.0.0.1:3002",
+    bridge: "ws://127.0.0.1:8091",
+    // libre-lnd identity (regenerates if the docker lnd volume is recreated — if
+    // Connect Peer fails, refresh via: docker exec libre-lnd lncli getinfo).
+    peer: "024228161e3c775fba9255f9253b15cfe12b214113fa7f71b28e42543a14c3ce7d@127.0.0.1:9735",
+  },
+  signet: {
+    esplora: "https://mutinynet.com/api",
+    bridge: "ws://127.0.0.1:8083",
+    peer: "02465ed5be53d04fde66c9418ff14a5f2267723810176c9212b722e542dc1afb1b@45.79.52.207:9735",
+  },
+  mainnet: {
+    esplora: "https://mempool.space/api",
+    // Point at your own LND/CLN node via a local websockify bridge (browser nodes
+    // can't dial out directly). Set these in .env.local (gitignored):
+    //   VITE_MAINNET_BRIDGE=ws://127.0.0.1:8085
+    //   VITE_MAINNET_PEER=<pubkey>@<host>:9735
+    bridge: ((import.meta as any).env?.VITE_MAINNET_BRIDGE as string)?.trim() || "",
+    peer: ((import.meta as any).env?.VITE_MAINNET_PEER as string)?.trim() || "",
+  },
+};
+
+networkSelect.addEventListener("change", () => {
+  // Network determines which wallet DB we use — switching needs a stopped node.
+  if (isNodeRunning) {
+    appendLog("[ERROR] Stop the node before switching networks.", "error");
+    return;
+  }
+  const preset = NETWORK_PRESETS[networkSelect.value];
+  if (!preset) return;
+  esploraUrlInput.value = preset.esplora;
+  wsBridgeUrlInput.value = preset.bridge;
+  lspConnStrInput.value = preset.peer;
+  try { localStorage.setItem("libre_ui_network", networkSelect.value); } catch {}
+  updateNetworkBadge();
+  appendLog(`[SYSTEM] Network set to ${networkSelect.value}; sync/bridge/peer fields updated.`, "system");
+  void refreshWalletForNetwork(networkSelect.value);
+});
+
+// Point `storage` at the given network's DB and reflect that wallet in the UI.
+// Returns true if that network already has a wallet seed.
+async function refreshWalletForNetwork(network: string): Promise<boolean> {
+  storage = new IndexedDBStorageProvider(dbNameForNetwork(network));
+  await setActiveNetwork(network);
+  const storedSeed = await storage.getItem("ldk_seed");
+  if (storedSeed && /^[0-9a-fA-F]{64}$/.test(storedSeed)) {
+    seedInput.value = storedSeed;
+    restoreBanner.classList.add("hidden");
+    return true;
+  }
+  seedInput.value = "";
+  restoreBanner.classList.remove("hidden");
+  return false;
+}
+
+// One-time copy of the legacy un-namespaced `libre-wallet` DB into the correct
+// network-scoped DB. Idempotent (localStorage flag + migrateStorage skips a
+// non-empty target). Legacy DB is left intact as a fallback.
+async function migrateLegacyStorageOnce(selectedNetwork: string): Promise<void> {
+  if (localStorage.getItem("libre_ns_migrated") === "1") return;
+  try {
+    const legacy = new IndexedDBStorageProvider("libre-wallet");
+    const legacySeed = await legacy.getItem("ldk_seed");
+    if (legacySeed && /^[0-9a-fA-F]{64}$/.test(legacySeed)) {
+      let net = selectedNetwork;
+      try {
+        const cfg = JSON.parse((await legacy.getItem("ldk_config")) || "{}");
+        if (cfg && typeof cfg.network === "string") net = cfg.network;
+      } catch {}
+      const target = new IndexedDBStorageProvider(dbNameForNetwork(net));
+      const copied = await migrateStorage(legacy, target);
+      appendLog(
+        copied > 0
+          ? `[SYSTEM] Migrated existing wallet into network storage (libre-wallet-${net}, ${copied} keys).`
+          : `[SYSTEM] Existing wallet already present in network storage (libre-wallet-${net}).`,
+        "system"
+      );
+    }
+    // Only mark migration done on the SUCCESS path. A transient IndexedDB error
+    // (quota, blocked upgrade) must be retried on the next load, not permanently
+    // recorded as complete — otherwise a funded legacy wallet is stranded behind
+    // a "No wallet found" banner while its channels sit unattended.
+    localStorage.setItem("libre_ns_migrated", "1");
+  } catch (e) {
+    appendLog(`[WARN] Storage migration failed, will retry on next load: ${e instanceof Error ? e.message : e}`, "warn");
+  }
+}
+
+// On page load, restore the previously-selected network (+ its preset) and the
+// existing wallet seed from storage, so a reload preserves your wallet and network
+// instead of resetting to regtest / the default seed (which Start would overwrite).
+void (async () => {
+  try {
+    // Default to mainnet (this is a mainnet product); returning users keep their last choice.
+    const savedNetwork = localStorage.getItem("libre_ui_network");
+    const initialNetwork = savedNetwork && NETWORK_PRESETS[savedNetwork] ? savedNetwork : "mainnet";
+    networkSelect.value = initialNetwork;
+    updateNetworkBadge();
+    const preset = NETWORK_PRESETS[initialNetwork];
+    esploraUrlInput.value = preset.esplora;
+    wsBridgeUrlInput.value = preset.bridge;
+    lspConnStrInput.value = preset.peer;
+  } catch {}
+  const selectedNetwork = networkSelect.value;
+  // Assign storage up-front so it's never undefined during the (possibly slow,
+  // first-load-only) migration await — a Start click in that window must not throw.
+  storage = new IndexedDBStorageProvider(dbNameForNetwork(selectedNetwork));
+  await migrateLegacyStorageOnce(selectedNetwork);
+  const hasWallet = await refreshWalletForNetwork(selectedNetwork);
+  if (hasWallet) {
+    appendLog("[SYSTEM] Restored existing wallet seed and network from storage.", "system");
+  }
+
+  // Auto-start on load (default on; persisted). A wallet should just run. The
+  // off-switch matters because a fresh page firing a full mainnet sync on every
+  // reload can trip public-Esplora rate limits (429) — turn it off if that bites.
+  const autostart = localStorage.getItem("libre_autostart") !== "0"; // default on
+  autostartCheckbox.checked = autostart;
+  // SAFETY: never auto-start a wallet whose seed exists but channel state is missing and
+  // that wasn't freshly created here — starting + connecting in that state force-closes
+  // channels. Require an explicit restore first.
+  const hasChannelState = !!(await storage.getItem("channel_manager"));
+  const createdNew = (await storage.getItem("wallet_created_new")) === "1";
+  const readiness = assessStartReadiness({ hasSeed: hasWallet, hasChannelState, createdNew });
+  if (readiness.needsRestore) {
+    appendLog(`[WARN] ${readiness.message}`, "warn");
+    restoreBanner.textContent = readiness.message ?? "";
+    restoreBanner.classList.remove("hidden");
+  }
+  if (autostart && readiness.canStart) {
+    // Only auto-reconnect the peer if we already have a channel to keep alive. A
+    // wallet with no channel state (a fresh/stranger wallet) starts but does NOT
+    // peer — peering then is pointless and just loads the configured node with
+    // every visitor. With a channel, reconnecting keeps it sendable across reloads.
+    autoConnectMode = hasChannelState;
+    appendLog("[SYSTEM] Auto-starting node…", "system");
+    startNodeBtn.click();
+  }
+
+  void tryAutoConnectDrive();
+})();
+
+autostartCheckbox.addEventListener("change", () => {
+  localStorage.setItem("libre_autostart", autostartCheckbox.checked ? "1" : "0");
+});
+const peersCountVal = document.getElementById("peers-count") as HTMLSpanElement;
+
 const connectLspBtn = document.getElementById("connect-lsp-btn") as HTMLButtonElement;
 
 const requestJitBtn = document.getElementById("request-jit-btn") as HTMLButtonElement;
@@ -127,38 +304,115 @@ const jitInvoiceContainer = document.getElementById("jit-invoice-container") as 
 const jitInvoiceStr = document.getElementById("jit-invoice-str") as HTMLTextAreaElement;
 const copyJitInvoiceBtn = document.getElementById("copy-jit-invoice-btn") as HTMLButtonElement;
 
+const lspPresetSelect = document.getElementById("lsp-preset") as HTMLSelectElement;
 const purchaseLsps1Btn = document.getElementById("purchase-lsps1-btn") as HTMLButtonElement;
+const lsps1ProviderSelect = document.getElementById("lsps1-provider") as HTMLSelectElement;
+const lsps1ProviderSummary = document.getElementById("lsps1-provider-summary") as HTMLSpanElement;
 const lsps1AmountInput = document.getElementById("lsps1-amount") as HTMLInputElement;
+const lsps1AmountMsg = document.getElementById("lsps1-amount-msg") as HTMLSpanElement;
+const lsps1LeaseSelect = document.getElementById("lsps1-lease") as HTMLSelectElement;
+const lsps1FeeReadout = document.getElementById("lsps1-fee-readout") as HTMLDivElement;
 const lsps1InvoiceContainer = document.getElementById("lsps1-invoice-container") as HTMLDivElement;
 const lsps1InvoiceStr = document.getElementById("lsps1-invoice-str") as HTMLTextAreaElement;
 const copyLsps1InvoiceBtn = document.getElementById("copy-lsps1-invoice-btn") as HTMLButtonElement;
 
-const clearLogsBtn = document.getElementById("clear-logs-btn") as HTMLButtonElement;
+// Known LSPs the app can one-click fill. Channels are always requested PRIVATE
+// (a browser node has no reachable address to announce), which is also all ZEUS
+// allows — public channels aren't needed for an outgoing/listener wallet.
+// NOTE: Megalith exposes LSPS1 over a REST binding; the peer connection below is
+// verified, but ordering capacity against the live endpoint may need the REST
+// transport (the current client speaks single-endpoint JSON-RPC).
+const LSP_PRESETS: Record<string, { connStr: string; apiUrl: string }> = {
+  megalith: {
+    connStr:
+      "038a9e56512ec98da2b5789761f7af8f280baf98a09282360cd6ff1381b5e889bf@64.23.162.51:9735",
+    apiUrl: "https://lsp1.megalith-node.com/api/lsps1/v1",
+  },
+};
 
-// V4V Elements
-const audioPlayer = document.getElementById("audio-player") as HTMLAudioElement;
-const streamRateInput = document.getElementById("stream-rate-input") as HTMLInputElement;
-const streamModeStatus = document.getElementById("stream-mode-status") as HTMLSpanElement;
-const satsStreamedVal = document.getElementById("sats-streamed-val") as HTMLSpanElement;
+lspPresetSelect.addEventListener("change", () => {
+  const preset = LSP_PRESETS[lspPresetSelect.value];
+  if (!preset) return; // "custom" — leave the fields as the user set them
+  lspConnStrInput.value = preset.connStr;
+  lspApiUrlInput.value = preset.apiUrl;
+  appendLog(
+    `[SYSTEM] LSP preset "${lspPresetSelect.value}" selected; connection fields filled (private channel).`,
+    "system"
+  );
+});
 
-const boostAmountInput = document.getElementById("boost-amount") as HTMLInputElement;
-const boostMessageInput = document.getElementById("boost-message") as HTMLInputElement;
-const boostSenderName = document.getElementById("boost-sender-name") as HTMLInputElement;
-const sendBoostagramBtn = document.getElementById("send-boostagram-btn") as HTMLButtonElement;
+
+
+// Receive (create invoice) Elements
+const receiveAmountInput = document.getElementById("receive-amount") as HTMLInputElement;
+const receiveDescInput = document.getElementById("receive-desc") as HTMLInputElement;
+const createInvoiceBtn = document.getElementById("create-invoice-btn") as HTMLButtonElement;
+const receiveInvoiceContainer = document.getElementById("receive-invoice-container") as HTMLDivElement;
+const receiveInvoiceStr = document.getElementById("receive-invoice-str") as HTMLTextAreaElement;
+const copyReceiveInvoiceBtn = document.getElementById("copy-receive-invoice-btn") as HTMLButtonElement;
+
+// On-chain sweep address: where force-closed funds get reclaimed (Event_SpendableOutputs).
+const sweepAddressInput = document.getElementById("sweep-address") as HTMLInputElement;
+const sweepAddressStatus = document.getElementById("sweep-address-status") as HTMLSpanElement;
+const SWEEP_ADDRESS_KEY = "libre_sweep_address";
+
+// Validate the address, persist it, and (if the node is running) push it to the wallet.
+// Returns the decoded scriptPubKey, or null if empty/invalid.
+function applySweepAddress(): Uint8Array | null {
+  const addr = sweepAddressInput.value.trim();
+  if (!addr) {
+    localStorage.removeItem(SWEEP_ADDRESS_KEY);
+    if (wallet) wallet.setSweepDestination(undefined);
+    sweepAddressStatus.textContent = "";
+    return null;
+  }
+  try {
+    const script = addressToScriptPubKey(addr, networkSelect.value);
+    localStorage.setItem(SWEEP_ADDRESS_KEY, addr);
+    if (wallet) wallet.setSweepDestination(script);
+    sweepAddressStatus.textContent = "✓ sweep address set";
+    return script;
+  } catch (e) {
+    sweepAddressStatus.textContent = `✗ ${e instanceof Error ? e.message : "invalid address"}`;
+    return null;
+  }
+}
+
+sweepAddressInput.value = localStorage.getItem(SWEEP_ADDRESS_KEY) || "";
+sweepAddressInput.addEventListener("change", () => { applySweepAddress(); });
 
 // NWC Elements
-const createNwcBtn = document.getElementById("create-nwc-btn") as HTMLButtonElement;
-const nwcConnNameInput = document.getElementById("nwc-conn-name") as HTMLInputElement;
-const nwcSpendingLimitInput = document.getElementById("nwc-spending-limit") as HTMLInputElement;
-const nwcRelayUrlInput = document.getElementById("nwc-relay-url") as HTMLInputElement;
-const nwcUriContainer = document.getElementById("nwc-uri-container") as HTMLDivElement;
-const nwcUriStr = document.getElementById("nwc-uri-str") as HTMLTextAreaElement;
-const copyNwcUriBtn = document.getElementById("copy-nwc-uri-btn") as HTMLButtonElement;
-const nwcQrImg = document.getElementById("nwc-qr-img") as HTMLImageElement;
-const nwcConnectionsList = document.getElementById("nwc-connections-list") as HTMLDivElement;
 
-let streamIntervalId: any = null;
-let totalSatsStreamed = 0;
+// Backup & Recovery Elements
+const exportStateBtn = document.getElementById("export-state-btn") as HTMLButtonElement;
+const importStateFile = document.getElementById("import-state-file") as HTMLInputElement;
+const importStateBtn = document.getElementById("import-state-btn") as HTMLButtonElement;
+const newWalletBtn = document.getElementById("new-wallet-btn") as HTMLButtonElement;
+const backupStatusEl = document.getElementById("backup-status") as HTMLSpanElement;
+const connectDriveBtn = document.getElementById("connect-drive-btn") as HTMLButtonElement;
+const backupDriveNowBtn = document.getElementById("backup-drive-now-btn") as HTMLButtonElement;
+const driveStatusEl = document.getElementById("drive-status") as HTMLSpanElement;
+const restoreDriveBtn = document.getElementById("restore-drive-btn") as HTMLButtonElement;
+const createWalletFields = document.getElementById("create-wallet-fields") as HTMLDivElement;
+const seedSavedCheckbox = document.getElementById("seed-saved-checkbox") as HTMLInputElement;
+const createWalletBtn = document.getElementById("create-wallet-btn") as HTMLButtonElement;
+const createWalletStatus = document.getElementById("create-wallet-status") as HTMLSpanElement;
+
+let driveSyncTimer: any = null;
+let driveSyncing = false;
+function loadDriveSyncedVersion(): number {
+  const s = localStorage.getItem(`libre_drive_synced_version_${networkSelect.value}`);
+  const n = s === null ? NaN : parseInt(s, 10);
+  return Number.isNaN(n) ? -1 : n;
+}
+// Baked-in OAuth Client ID (set VITE_GOOGLE_CLIENT_ID in packages/example-app/.env.local).
+// Falls back to the paste field when not configured.
+const BAKED_CLIENT_ID =
+  ((import.meta as any).env?.VITE_GOOGLE_CLIENT_ID as string | undefined)?.trim() || "";
+function resolveClientId(): string {
+  return BAKED_CLIENT_ID;
+}
+
 
 
 // Helper to extract hex node id from byte array
@@ -179,41 +433,217 @@ toggleSeedBtn.addEventListener("click", () => {
   }
 });
 
-clearLogsBtn.addEventListener("click", () => {
-  terminalContent.innerHTML = "";
-  appendLog("[SYSTEM] Console cleared.", "system");
+// Show the current wallet's seed as its 24-word BIP39 recovery phrase. Works with
+// whatever is in the Seed field (phrase or hex) or the seed already in storage —
+// so a user who only has the legacy 64-hex seed can retrieve their words.
+showPhraseBtn.addEventListener("click", async () => {
+  try {
+    let seedHex = resolveSeedInput(seedInput.value);
+    if (!seedHex) {
+      const stored = await storage.getItem("ldk_seed");
+      if (stored && /^[0-9a-fA-F]{64}$/.test(stored)) seedHex = stored;
+    }
+    if (!seedHex) {
+      appendLog("[ERROR] No seed available — create or restore a wallet first.", "error");
+      return;
+    }
+    seedPhraseWords.value = seedHexToMnemonic(seedHex);
+    seedPhraseBox.classList.remove("hidden");
+    appendLog("[SYSTEM] Recovery phrase shown. Write down the 24 words in order.", "system");
+  } catch (e) {
+    appendLog(`[ERROR] Could not derive recovery phrase: ${e instanceof Error ? e.message : e}`, "error");
+  }
 });
 
-logFilter.addEventListener("change", applyLogFilter);
+copyPhraseBtn.addEventListener("click", async () => {
+  if (!seedPhraseWords.value) return;
+  try {
+    await navigator.clipboard.writeText(seedPhraseWords.value);
+    appendLog("[SYSTEM] Recovery phrase copied to clipboard.", "system");
+  } catch {
+    appendLog("[WARN] Clipboard blocked — select and copy the phrase manually.", "warn");
+  }
+});
+
+initLogControls();
 
 // 6. Start LDK Node
+// Renders balance + channel list with connected/active status. Safe to call any time.
+function refreshWalletView(): void {
+  try {
+    if (!wallet || !isNodeRunning) {
+      balanceSpendableEl.textContent = "0 sats";
+      balanceReceivableEl.textContent = "0 sats";
+      channelsCountEl.textContent = "0";
+      channelsListEl.textContent = "No channels yet";
+      return;
+    }
+    const bal = wallet.getBalance();
+    const chans = wallet.getChannels();
+    balanceSpendableEl.textContent = `${bal.spendableSat} sats`;
+    balanceReceivableEl.textContent = `${bal.receivableSat} sats`;
+    channelsCountEl.textContent = String(chans.length);
+    if (chans.length === 0) {
+      channelsListEl.textContent = "No channels yet";
+      return;
+    }
+    channelsListEl.innerHTML = chans
+      .map((c) => {
+        const badge = c.isUsable
+          ? '<span style="color:#22c55e">● active</span>'
+          : c.isChannelReady
+          ? '<span style="color:#f59e0b">● ready (peer offline)</span>'
+          : '<span style="color:#9ca3af">● pending</span>';
+        const txUrl = c.fundingTxid ? mempoolTxUrl(c.fundingTxid, networkSelect.value) : null;
+        const txLink = txUrl
+          ? ` · <a href="${txUrl}" target="_blank" rel="noopener" class="value" style="text-decoration:underline">funding tx ↗</a>`
+          : "";
+        const conf = channelConfLabel(c.confirmations, c.confirmationsRequired, c.isChannelReady);
+        const confStr = conf ? ` · ${conf}` : "";
+        return `<div class="status-line"><span class="value">${c.channelId.slice(0, 8)}… ${badge}${confStr}</span>` +
+          `<span class="value">cap ${c.capacitySat} · send ${c.outboundSendableSat} / recv ${c.inboundSat}${txLink}</span></div>`;
+      })
+      .join("");
+  } catch (e) {
+    appendLog(`[WARN] refreshWalletView failed: ${e instanceof Error ? e.message : e}`, "warn");
+  }
+}
+
+// Show how many channels the routing graph holds. Multi-hop sends (v4vmusic boosts
+// to arbitrary artists) need a populated graph; a count near zero means routing will
+// fail and the user should Sync gossip first.
+function renderGraphStatus(): void {
+  if (!wallet || !isNodeRunning) {
+    gossipStatusEl.textContent = "0 channels";
+    return;
+  }
+  try {
+    const ng = wallet.getNetworkGraph();
+    if (!ng) {
+      gossipStatusEl.textContent = "unavailable";
+      return;
+    }
+    const readOnly = ng.read_only();
+    const count = readOnly.list_channels().length;
+    readOnly.free(); // ReadOnlyNetworkGraph holds a read lock that must be freed.
+    gossipStatusEl.textContent = `${count.toLocaleString()} channels`;
+  } catch (e) {
+    gossipStatusEl.textContent = "unavailable";
+    appendLog(`[WARN] renderGraphStatus failed: ${e instanceof Error ? e.message : e}`, "warn");
+  }
+}
+
+// Fetch a Rapid Gossip Sync snapshot (via the CORS proxy) and refresh the readout.
+// No-op on non-mainnet (no RGS URL ⇒ syncGossip returns immediately).
+async function syncGossipAndRender(): Promise<void> {
+  if (!wallet || !isNodeRunning) return;
+  try {
+    syncGossipBtn.disabled = true;
+    gossipStatusEl.textContent = "Syncing gossip…";
+    await wallet.syncGossip();
+    renderGraphStatus();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    appendLog(`[WARN] Gossip sync failed: ${msg}`, "warn");
+    gossipStatusEl.textContent = `Sync failed: ${msg}`;
+  } finally {
+    if (wallet && isNodeRunning) syncGossipBtn.disabled = false;
+  }
+}
+
+syncGossipBtn.addEventListener("click", () => {
+  void syncGossipAndRender();
+});
+
 startNodeBtn.addEventListener("click", async () => {
   try {
+    // A seed was generated via Create New Wallet but the wallet hasn't been
+    // created yet. Don't let Start bypass the save-seed step.
+    if (pendingSeed) {
+      appendLog(
+        "[ERROR] Finish creating your wallet first: tick ‘I've saved my recovery seed’ and click ‘Create Wallet’. " +
+          "(Reload the page to cancel.)",
+        "error"
+      );
+      return;
+    }
     startNodeBtn.disabled = true;
     appendLog("[SYSTEM] Initializing LibreListenerWallet...", "system");
     appendLog("[SYSTEM] Fetching and compiling LDK WebAssembly...", "system");
 
-    // Save custom seed to localStorage before start
-    const seed = seedInput.value.trim();
-    if (seed.length !== 64) {
-      throw new Error("Seed must be a 32-byte hex string (64 characters)");
+    // Resolve the seed: prefer the field (24-word phrase or 64-hex, manual entry /
+    // New Wallet), else fall back to the seed already in storage (e.g. after a
+    // passphrase-only restore).
+    let seed = resolveSeedInput(seedInput.value) ?? "";
+    if (!seed) {
+      const stored = await storage.getItem("ldk_seed");
+      if (stored && /^[0-9a-fA-F]{64}$/.test(stored)) {
+        seed = stored;
+        seedInput.value = stored;
+      } else {
+        throw new Error("No wallet seed found. Create a New Wallet or restore a backup first.");
+      }
     }
+
+    // SAFETY GUARD: refuse to start when a seed has no channel state and this wasn't a
+    // brand-new wallet created here (e.g. a pasted seed, or an incomplete restore).
+    // Starting + connecting would tell the peer "unknown channel" → force-close. Restore first.
+    const startHasChannelState = !!(await storage.getItem("channel_manager"));
+    const startCreatedNew = (await storage.getItem("wallet_created_new")) === "1";
+    const startReadiness = assessStartReadiness({ hasSeed: true, hasChannelState: startHasChannelState, createdNew: startCreatedNew });
+    if (!startReadiness.canStart) {
+      const msg = startReadiness.message ?? "Wallet is not ready to start.";
+      appendLog(`[ERROR] ${msg}`, "error");
+      restoreBanner.textContent = msg;
+      restoreBanner.classList.remove("hidden");
+      startNodeBtn.disabled = false;
+      return;
+    }
+
     await storage.setItem("ldk_seed", seed);
 
     const esploraUrl = esploraUrlInput.value.trim();
+    const selectedNetwork = networkSelect.value as "mainnet" | "testnet" | "regtest" | "signet";
 
-    // Save current config to storage so SW can read it
-    const ldkConfig = { network: "regtest" as const, esploraUrl };
+    // Save current config to storage so the service worker can read it on an offline
+    // push wake-up (it has no DOM). Include the bridge URL so the SW dials the real
+    // (remote) bridge instead of a hardcoded localhost default.
+    const ldkConfig = { network: selectedNetwork, esploraUrl, bridgeUrl: wsBridgeUrlInput.value.trim() };
     await storage.setItem("ldk_config", JSON.stringify(ldkConfig));
+    await setActiveNetwork(selectedNetwork);
+
+    // Allowlist the LSPs that genuinely offer 0-conf (Megalith: min_required_channel_confirmations
+    // 0) so their channels are usable instantly. The SDK still only 0-conf-accepts when the opener
+    // actually requests a zeroconf channel type (else it falls back to a confirmed channel), so a
+    // provider that opens a normal channel can't trip the "min depth zero" rejection. Confirmed-only
+    // LSPs (Olympus, 3-conf) aren't listed and get a normal channel that locks in at minChannelConfirmations.
+    const trustedZeroConfPeers: string[] = zeroConfTrustedPubkeys();
 
     wallet = new LibreListenerWallet({
       config: {
-        network: "regtest",
+        network: selectedNetwork,
         esploraUrl,
+        trustedZeroConfPeers,
+        // Rapid Gossip Sync populates the network graph so the router can find
+        // multi-hop routes (e.g. a v4vmusic boost to an arbitrary artist). The LDK
+        // RGS server is CORS-blocked in the browser, so VITE_MAINNET_RGS must point
+        // at a CORS-enabled proxy (the push gateway's /rgs/snapshot route). Mainnet-only.
+        rapidGossipSyncUrl: rgsUrlForNetwork(
+          selectedNetwork,
+          (import.meta as any).env?.VITE_MAINNET_RGS as string | undefined
+        ),
+        // Public channels on real networks (e.g. accepting the Mutinynet faucet's
+        // announced channel); private on regtest where our LND opens --private.
+        announceChannels: selectedNetwork !== "regtest",
+        // Broadcast a node name so peers show it instead of "Unknown" (only
+        // propagates once a public channel is announced).
+        alias: "Libre Listener Wallet",
       },
       storage,
       socketProvider: new BrowserWebSocketStreamProvider(),
-      wasmUrl: "/liblightningjs.wasm",
+      wasmUrl: `${import.meta.env.BASE_URL}liblightningjs.wasm`,
+      // Per-origin single-node lock: only one tab/window may run this network's node at a time.
+      acquireRunLock: () => acquireWebNodeLock(nodeLockName(dbNameForNetwork(selectedNetwork))),
       logger: {
         info: (msg: string, ...args: any[]) => {
           console.log(msg, ...args);
@@ -246,22 +676,46 @@ startNodeBtn.addEventListener("click", async () => {
         const peers = wallet.getConnectedPeers();
         peersCountVal.innerText = peers.length.toString();
       }
+      refreshWalletView();
     });
 
     await wallet.start();
     isNodeRunning = true;
+    // Apply the saved on-chain sweep address so a force-close auto-recovers funds.
+    applySweepAddress();
+    // Event-driven backup status + Drive auto-sync (replaces 2s polling).
+    wallet.onStateChanged(onWalletStateChanged);
+    onWalletStateChanged();
+    refreshWalletView();
+    if (walletViewTimer) clearInterval(walletViewTimer);
+    walletViewTimer = setInterval(refreshWalletView, 5000);
+    syncGossipBtn.disabled = false;
+    renderGraphStatus();
+    // Warm the routing graph in the background so multi-hop sends can find a route.
+    // No-op off mainnet (no RGS URL configured).
+    void syncGossipAndRender();
     appendLog("[SYSTEM] LDK Node running successfully!", "system");
 
     // Update UI Status
     walletStatusBadge.innerText = "Running";
     walletStatusBadge.className = "badge badge-status running";
     stopNodeBtn.disabled = false;
+    networkSelect.disabled = true;
     connectLspBtn.disabled = false;
     requestJitBtn.disabled = false;
-    purchaseLsps1Btn.disabled = false;
-    sendBoostagramBtn.disabled = false;
-    createNwcBtn.disabled = false;
+    refreshLsps1Provider(); // enables purchase only if the amount fits the selected provider
+    setV4VEnabled(true);
+    createInvoiceBtn.disabled = false;
+    setNwcEnabled(true);
+    exportStateBtn.disabled = false;
+    newWalletBtn.disabled = true;
     await updateNwcConnectionsList();
+
+    // For a freshly created wallet, best-effort sync + verify the backup to Drive.
+    if (justCreated) {
+      justCreated = false;
+      await createAndVerifyBackup();
+    }
 
 
     // Display Node ID
@@ -270,9 +724,40 @@ startNodeBtn.addEventListener("click", async () => {
       const nodeId = bytesToHex(mgr.get_our_node_id());
       nodeIdVal.innerText = nodeId;
     }
+
+    // When auto-started on load, also auto-connect the configured peer.
+    if (autoConnectMode) {
+      autoConnectMode = false;
+      if (lspConnStrInput.value.trim().includes("@")) {
+        appendLog("[SYSTEM] Auto-connecting to peer…", "system");
+        connectLspBtn.click();
+      }
+    }
   } catch (err: any) {
-    appendLog(`[ERROR] Start failed: ${err.message}`, "error");
+    if (isNodeAlreadyRunningError(err)) {
+      appendLog("[ERROR] This wallet is already running in another tab/window.", "error");
+    } else if (isChannelStateRegressionError(err)) {
+      const msg = "This wallet's channel state is behind what it durably reached — starting now would force-close your channels. Restore from your latest backup before starting.";
+      appendLog(`[ERROR] ${msg}`, "error");
+      restoreBanner.textContent = msg;
+      restoreBanner.classList.remove("hidden");
+    } else {
+      appendLog(`[ERROR] Start failed: ${err.message}`, "error");
+    }
+    // A start() that threw mid-way may have left timers/sockets running on a
+    // half-initialized instance. Tear it down and drop the reference so a retry
+    // builds a clean instance instead of a second one writing the same storage.
+    try {
+      await wallet?.stop();
+    } catch (stopErr: any) {
+      appendLog(`[WARN] Cleanup after failed start also failed: ${stopErr?.message ?? stopErr}`, "warn");
+    }
+    wallet = null;
+    isNodeRunning = false;
     startNodeBtn.disabled = false;
+    // Don't leak post-start intents into a later manual Start if this one failed.
+    justCreated = false;
+    autoConnectMode = false;
   }
 });
 
@@ -282,6 +767,11 @@ stopNodeBtn.addEventListener("click", async () => {
   try {
     stopNodeBtn.disabled = true;
     appendLog("[SYSTEM] Shutting down LDK Node...", "system");
+    // Cancel any debounced Drive upload so it can't fire after teardown.
+    if (driveSyncTimer) {
+      clearTimeout(driveSyncTimer);
+      driveSyncTimer = null;
+    }
     await wallet.stop();
     isNodeRunning = false;
     wallet = null;
@@ -293,28 +783,26 @@ stopNodeBtn.addEventListener("click", async () => {
     walletStatusBadge.className = "badge badge-status stopped";
     startNodeBtn.disabled = false;
     stopNodeBtn.disabled = true;
+    networkSelect.disabled = false;
     connectLspBtn.disabled = true;
     requestJitBtn.disabled = true;
     purchaseLsps1Btn.disabled = true;
-    sendBoostagramBtn.disabled = true;
-    createNwcBtn.disabled = true;
-    nwcUriContainer.classList.add("hidden");
-    nwcConnectionsList.innerHTML = '<div class="empty-list-text text-muted" style="font-size: 0.85rem;">No active pairings yet.</div>';
+    setV4VEnabled(false);
+    setNwcEnabled(false);
+    exportStateBtn.disabled = true;
+    newWalletBtn.disabled = false;
     nodeIdVal.innerText = "-";
     peersCountVal.innerText = "0";
+    if (walletViewTimer) {
+      clearInterval(walletViewTimer);
+      walletViewTimer = null;
+    }
+    refreshWalletView(); // renders zeros / "No channels yet"
+    syncGossipBtn.disabled = true;
+    renderGraphStatus();
     jitInvoiceContainer.classList.add("hidden");
     lsps1InvoiceContainer.classList.add("hidden");
 
-    // Reset V4V state
-    audioPlayer.pause();
-    if (streamIntervalId) {
-      clearInterval(streamIntervalId);
-      streamIntervalId = null;
-    }
-    streamModeStatus.innerText = "Inactive";
-    streamModeStatus.className = "value text-warning";
-    totalSatsStreamed = 0;
-    satsStreamedVal.innerText = "0";
 
   } catch (err: any) {
     appendLog(`[ERROR] Stop failed: ${err.message}`, "error");
@@ -360,7 +848,12 @@ requestJitBtn.addEventListener("click", async () => {
     requestJitBtn.disabled = true;
     jitInvoiceContainer.classList.add("hidden");
 
-    const amountSats = parseInt(jitAmountInput.value, 10);
+    const amountRes = parsePositiveIntSats(jitAmountInput.value);
+    if (!amountRes.ok) {
+      appendLog(`[ERROR] ${amountRes.error}`, "error");
+      return;
+    }
+    const amountSats = amountRes.value;
     const description = jitDescInput.value.trim();
     const lspConnStr = lspConnStrInput.value.trim();
     const [lspPubkey] = lspConnStr.split("@");
@@ -390,39 +883,174 @@ requestJitBtn.addEventListener("click", async () => {
   }
 });
 
-copyJitInvoiceBtn.addEventListener("click", () => {
-  navigator.clipboard.writeText(jitInvoiceStr.value);
-  appendLog("[SYSTEM] JIT Invoice copied to clipboard.", "system");
+copyJitInvoiceBtn.addEventListener("click", () => copyToClipboard(jitInvoiceStr.value, "JIT Invoice copied to clipboard."));
+
+// Copy the wallet's node id (pubkey) — this is what you paste into your node's
+// `openchannel --node_key=` to open a channel to the browser wallet.
+copyNodeIdBtn.addEventListener("click", () => {
+  const id = nodeIdVal.innerText.trim();
+  if (!id || id === "-") {
+    appendLog("[ERROR] Start the node first — the Node ID appears once it's running.", "error");
+    return;
+  }
+  void copyToClipboard(id, "Node ID copied — paste it into your node's openchannel.");
 });
 
+createInvoiceBtn.addEventListener("click", async () => {
+  if (!wallet || !isNodeRunning) return;
+  try {
+    createInvoiceBtn.disabled = true;
+    const amountRes = parsePositiveIntSats(receiveAmountInput.value);
+    if (!amountRes.ok) {
+      appendLog(`[ERROR] ${amountRes.error}`, "error");
+      return;
+    }
+    const amount = amountRes.value;
+    const desc = receiveDescInput.value.trim() || "Libre Listener Wallet";
+    appendLog(`[Receive] Creating BOLT11 invoice for ${amount} sats...`, "system");
+    const invoice = await wallet.createInvoice(amount, desc);
+    receiveInvoiceStr.value = invoice;
+    receiveInvoiceContainer.classList.remove("hidden");
+    appendLog(`[Receive] Invoice created — pay it from your channel peer to fund the wallet.`, "system");
+  } catch (err) {
+    appendLog(`[ERROR] Failed to create invoice: ${err instanceof Error ? err.message : err}`, "error");
+  } finally {
+    createInvoiceBtn.disabled = false;
+  }
+});
+
+copyReceiveInvoiceBtn.addEventListener("click", () => copyToClipboard(receiveInvoiceStr.value, "Invoice copied to clipboard."));
+
 // 10. Purchase LSPS1 Capacity
+// Keep the picker informed: reflect the selected provider's cost/lease character + sat bounds, and
+// validate the requested amount against that provider (Megalith rejects <150k; Olympus serves 100k+).
+function refreshLsps1Provider(): void {
+  const providerKey = lsps1ProviderSelect.value;
+  const provider = LSPS1_REST_PROVIDERS[providerKey] ?? LSPS1_REST_PROVIDERS.megalith;
+  lsps1ProviderSummary.textContent = providerSummary(provider);
+  lsps1AmountInput.min = String(provider.minChannelSat);
+  lsps1AmountInput.max = String(provider.maxChannelSat);
+
+  // Only offer lease durations the provider actually grants — Megalith caps at ~3 months, so its 6/12
+  // month options must be disabled (else the SDK silently clamps them back down).
+  for (const opt of Array.from(lsps1LeaseSelect.options)) {
+    if (opt.value === "") {
+      opt.textContent = `Longest available (~${provider.leaseMonthsApprox} months, recommended)`;
+      continue;
+    }
+    opt.disabled = !isLeaseOptionAvailable(parseInt(opt.value, 10) || 0, provider.maxLeaseBlocks);
+  }
+  lsps1LeaseSelect.value = clampLeaseSelectionValue(lsps1LeaseSelect.value, provider.maxLeaseBlocks);
+
+  const amountSats = parseInt(lsps1AmountInput.value, 10);
+  const check = validateAmountForProvider(amountSats, provider);
+  if (check.ok) {
+    lsps1AmountMsg.textContent = "";
+    lsps1AmountMsg.style.color = "";
+    purchaseLsps1Btn.disabled = !(wallet && isNodeRunning);
+  } else {
+    const alt = suggestProviderForAmount(amountSats, providerKey);
+    const hint = alt ? ` Try ${alt.provider.name}, which serves this size.` : "";
+    lsps1AmountMsg.textContent = `${check.message ?? "Invalid amount."}${hint}`;
+    lsps1AmountMsg.style.color = "var(--color-danger, #d9534f)";
+    purchaseLsps1Btn.disabled = true;
+  }
+}
+lsps1ProviderSelect.addEventListener("change", refreshLsps1Provider);
+lsps1AmountInput.addEventListener("input", refreshLsps1Provider);
+refreshLsps1Provider();
+
+// Polls get_order after the invoice is shown so the user sees payment land: paid → hide the invoice
+// + "opening your channel", COMPLETED → "channel open", FAILED → error. A token cancels a stale poll
+// when a new order is placed; transient errors are ignored (best-effort).
+let lsps1PollToken = 0;
+function startLsps1OrderPoll(apiUrl: string, orderId: string): void {
+  const token = ++lsps1PollToken;
+  const deadline = Date.now() + 15 * 60 * 1000;
+  const tick = async () => {
+    if (token !== lsps1PollToken || !wallet) return;
+    try {
+      const order = await wallet.getLSPS1Order(apiUrl, orderId);
+      if (token !== lsps1PollToken) return;
+      const status = lsps1OrderStatus(order);
+      if (status === "completed") {
+        lsps1InvoiceContainer.classList.add("hidden");
+        appendLog("[LSPS1] 🎉 Channel open! Check the channel status above.", "system");
+        refreshWalletView();
+        return;
+      }
+      if (status === "failed") {
+        appendLog("[LSPS1] Order failed — the LSP could not open the channel.", "error");
+        return;
+      }
+      if (status === "paid") {
+        lsps1InvoiceContainer.classList.add("hidden");
+        appendLog("[LSPS1] ✓ Payment received — opening your channel… (this can take a few confirmations)", "system");
+        refreshWalletView();
+      }
+    } catch {
+      /* transient — keep polling */
+    }
+    if (token === lsps1PollToken && Date.now() < deadline) setTimeout(() => void tick(), 4000);
+  };
+  setTimeout(() => void tick(), 4000);
+}
+
 purchaseLsps1Btn.addEventListener("click", async () => {
   if (!wallet || !isNodeRunning) return;
+
+  const amountSats = parseInt(lsps1AmountInput.value, 10);
+  // Real mainnet LSP over the LSPS1 REST binding — api_url is the provider's REST base; the peer
+  // node is read live from its get_info uris (not lsp.connection_string).
+  const providerKey = lsps1ProviderSelect.value;
+  const provider = LSPS1_REST_PROVIDERS[providerKey] ?? LSPS1_REST_PROVIDERS.megalith;
+
+  // Guard the doomed request client-side (the LSP would reject an out-of-range size anyway).
+  const check = validateAmountForProvider(amountSats, provider);
+  if (!check.ok) {
+    const alt = suggestProviderForAmount(amountSats, providerKey);
+    const hint = alt ? ` Try ${alt.provider.name}.` : "";
+    appendLog(`[LSPS1] ${check.message}${hint}`, "error");
+    return;
+  }
+
   try {
     purchaseLsps1Btn.disabled = true;
     lsps1InvoiceContainer.classList.add("hidden");
-
-    const amountSats = parseInt(lsps1AmountInput.value, 10);
-    const lspConnStr = lspConnStrInput.value.trim();
-    const [lspPubkey] = lspConnStr.split("@");
+    lsps1FeeReadout.classList.add("hidden");
 
     const lsp = {
-      name: "libre-lsp",
-      pubkey: lspPubkey,
-      connection_string: lspConnStr,
-      api_url: lspApiUrlInput.value.trim().replace("/lsps2", "/lsps1"), // Fallback LSPS1 api endpoint
+      name: provider.name,
+      pubkey: "",
+      connection_string: "",
+      api_url: provider.restBaseUrl,
       protocols: ["lsps1" as const],
     };
 
-    appendLog(`[LSPS1] Purchasing ${amountSats} sats inbound capacity...`, "system");
-    const invoice = await wallet.purchaseLSPS1Capacity({
+    // Empty value = "Longest available" → let the SDK default to the LSP's max lease.
+    const leaseRaw = lsps1LeaseSelect.value.trim();
+    const channelExpiryBlocks = leaseRaw ? parseInt(leaseRaw, 10) : undefined;
+
+    appendLog(
+      `[LSPS1] Ordering ${amountSats} sats inbound from ${provider.name}${channelExpiryBlocks ? ` (~${channelExpiryBlocks} block lease)` : " (longest lease)"}...`,
+      "system"
+    );
+    const order = await wallet.purchaseLSPS1Capacity({
       amountSats,
       lsp,
+      ...(channelExpiryBlocks !== undefined ? { channelExpiryBlocks } : {}),
     });
 
-    appendLog(`[LSPS1] Order placed! Pay invoice: ${invoice.substring(0, 30)}...`, "system");
-    lsps1InvoiceStr.value = invoice;
+    const feeText = formatOpeningFee(order.feeTotalSat, amountSats);
+    appendLog(
+      `[LSPS1] Order ${order.orderId} placed via ${provider.name}. Opening fee: ${feeText}. Pay invoice: ${order.invoice.substring(0, 30)}…`,
+      "system"
+    );
+    lsps1FeeReadout.textContent = `${provider.name} opening fee: ${feeText} — pay only if you want this channel.`;
+    lsps1FeeReadout.classList.remove("hidden");
+    lsps1InvoiceStr.value = order.invoice;
     lsps1InvoiceContainer.classList.remove("hidden");
+    startLsps1OrderPoll(provider.restBaseUrl, order.orderId);
   } catch (err: any) {
     appendLog(`[ERROR] LSPS1 purchase failed: ${err.message}`, "error");
   } finally {
@@ -430,443 +1058,466 @@ purchaseLsps1Btn.addEventListener("click", async () => {
   }
 });
 
-copyLsps1InvoiceBtn.addEventListener("click", () => {
-  navigator.clipboard.writeText(lsps1InvoiceStr.value);
-  appendLog("[SYSTEM] LSPS1 Invoice copied to clipboard.", "system");
+copyLsps1InvoiceBtn.addEventListener("click", () => copyToClipboard(lsps1InvoiceStr.value, "LSPS1 Invoice copied to clipboard."));
+
+
+
+
+initV4V(ctx);
+initNwcUi(ctx);
+initWebPush(ctx);
+
+// Backup & Recovery Handlers
+exportStateBtn.addEventListener("click", async () => {
+  if (!wallet) {
+    appendLog("[ERROR] Start the node before exporting.", "error");
+    return;
+  }
+  try {
+    const blob = await wallet.exportState();
+    const url = URL.createObjectURL(new Blob([blob], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `libre-wallet-backup-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    localStorage.setItem(`libre_last_backup_version_${networkSelect.value}`, String(wallet.getStateVersion()));
+    refreshBackupStatus();
+    appendLog("[SYSTEM] Encrypted backup downloaded. Keep it and your seed safe.", "system");
+  } catch (e) {
+    appendLog(`[ERROR] Export failed: ${e instanceof Error ? e.message : e}`, "error");
+  }
 });
 
-// 11. V4V Audio Streaming Event Listeners
-audioPlayer.addEventListener("play", () => {
+importStateBtn.addEventListener("click", async () => {
+  // Never restore while the node is live: writing channel_manager/monitors while the
+  // running node concurrently persists to the same IndexedDB mixes two states →
+  // documented force-close hazard. Mirror the Drive-restore guard.
+  if (isNodeRunning) {
+    appendLog("[ERROR] Stop the node before restoring.", "error");
+    return;
+  }
+  const file = importStateFile.files?.[0];
+  if (!file) {
+    appendLog("[ERROR] Choose a backup file first.", "error");
+    return;
+  }
+  const seed = resolveSeedInput(seedInput.value);
+  if (!seed) {
+    appendLog("[ERROR] Paste your 64-hex seed (or 24-word recovery phrase) in the Seed field to decrypt the backup.", "error");
+    return;
+  }
+  try {
+    const blob = await file.text();
+    const importWallet = new LibreListenerWallet({
+      config: {
+        network: networkSelect.value as "mainnet" | "testnet" | "regtest" | "signet",
+        esploraUrl: esploraUrlInput.value.trim(),
+      },
+      storage,
+      socketProvider: new BrowserWebSocketStreamProvider(),
+      wasmUrl: `${import.meta.env.BASE_URL}liblightningjs.wasm`,
+    });
+    await importWallet.importState(blob, seed);
+    appendLog("[SYSTEM] Backup restored to storage. Click Start Node to boot the recovered wallet.", "system");
+  } catch (e) {
+    appendLog(`[ERROR] Restore failed: ${e instanceof Error ? e.message : e}`, "error");
+  }
+});
+
+// Enable "Create Wallet" once the user confirms they saved the seed.
+function updateCreateWalletBtnState(): void {
+  createWalletBtn.disabled = !seedSavedCheckbox.checked;
+}
+seedSavedCheckbox.addEventListener("change", updateCreateWalletBtnState);
+
+// Step 1 — "Create New Wallet": generate + reveal a fresh seed and show the
+// "I saved it" panel. No state is written yet.
+newWalletBtn.addEventListener("click", async () => {
+  if (isNodeRunning) {
+    appendLog("[ERROR] Stop the node before creating a new wallet.", "error");
+    return;
+  }
+  // Best-effort durable storage (warn, don't block — persist() is false on plain
+  // localhost windows too; the saved seed is the real safety net).
+  if (!(await ensurePersistentStorage())) {
+    appendLog(
+      "[WARN] Browser did not grant persistent storage. In a normal window your data still survives; in a " +
+        "private/Incognito window it is WIPED when the window closes. Save your seed!",
+      "warn"
+    );
+  }
+  const seedBytes = new Uint8Array(32);
+  crypto.getRandomValues(seedBytes);
+  pendingSeed = Array.from(seedBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  seedInput.value = pendingSeed;
+  seedInput.type = "text"; // reveal so they can copy it
+  seedSavedCheckbox.checked = false;
+  updateCreateWalletBtnState();
+  createWalletFields.classList.remove("hidden");
+  // Hex seed is the primary artifact (simplest). The 24-word BIP39 phrase is an optional export
+  // for moving to another wallet — available via "Show recovery phrase" — so keep its box hidden.
+  seedPhraseBox.classList.add("hidden");
+  createWalletStatus.textContent = "Save the seed above, tick the box, then Create Wallet";
+  appendLog("[SYSTEM] New seed generated and shown above. SAVE IT NOW (paper/password manager), then tick the box. (Optional: export a 24-word recovery phrase via ‘Show recovery phrase’.)", "system");
+});
+
+// Step 2 — "Create Wallet": persist the new wallet, then start the node (which
+// best-effort syncs + verifies the seed-encrypted backup to Drive).
+createWalletBtn.addEventListener("click", async () => {
+  if (!pendingSeed) {
+    appendLog("[ERROR] Click ‘Create New Wallet’ first to generate a seed.", "error");
+    return;
+  }
+  if (!seedSavedCheckbox.checked) {
+    appendLog("[ERROR] Confirm you saved the seed first.", "error");
+    return;
+  }
+  try {
+    const existing = await storage.getItem("ldk_seed");
+    if (
+      existing &&
+      !window.confirm("Replace the wallet in this browser? Make sure you have a backup of the current one first.")
+    ) {
+      // Abort cleanly: drop the unsaved new seed, restore the field to the real
+      // wallet seed, and hide the panel so Start isn't blocked by pendingSeed.
+      pendingSeed = null;
+      seedInput.value = existing;
+      seedSavedCheckbox.checked = false;
+      createWalletFields.classList.add("hidden");
+      createWalletStatus.textContent = "—";
+      appendLog("[SYSTEM] New wallet cancelled — existing wallet kept.", "system");
+      return;
+    }
+    await storage.clear();
+    await storage.setItem("ldk_seed", pendingSeed);
+    // Provenance: this seed was created brand-new here, so it's allowed to bootstrap a
+    // fresh node with no channel state (the safety guard reads this). Cleared once channel
+    // state is persisted (onWalletStateChanged).
+    await storage.setItem("wallet_created_new", "1");
+    pendingSeed = null; // consumed
+    justCreated = true;
+    // A brand-new wallet has no channel, so do NOT auto-connect the peer — otherwise
+    // every visitor who creates a wallet silently peers to the configured node. The
+    // user clicks "Connect Peer" explicitly when they're ready to open their first
+    // channel. Auto-reconnect only kicks in once channel state exists (see load path).
+    autoConnectMode = false;
+    createWalletFields.classList.add("hidden");
+    // The new-seed reveal (newWalletBtn set type="text") must not linger — re-mask
+    // the field and re-sync the Show/Hide toggle so the seed isn't left on screen.
+    seedInput.type = "password";
+    toggleSeedBtn.innerText = "Show";
+    nodeIdVal.innerText = "-";
+    createWalletStatus.textContent = "Wallet created — starting node…";
+    appendLog("[SYSTEM] Wallet created. Starting node…", "system");
+    startNodeBtn.click(); // auto-start → best-effort Drive backup because justCreated is set
+  } catch (e) {
+    appendLog(`[ERROR] Create wallet failed: ${e instanceof Error ? e.message : e}`, "error");
+  }
+});
+
+// Reflect whether the on-disk backup file is current vs. the wallet's channel state.
+function refreshBackupStatus() {
   if (!wallet || !isNodeRunning) {
-    appendLog("[SYSTEM] Start the LDK Node before playing to enable V4V streaming.", "warn");
-    audioPlayer.pause();
+    backupStatusEl.textContent = "—";
+    backupStatusEl.className = "value";
     return;
   }
-  
-  appendLog("[V4V] Audio playback started. Beginning streaming micropayments...", "system");
-  streamModeStatus.innerText = "Active";
-  streamModeStatus.className = "value text-success";
-  
-  if (streamIntervalId) clearInterval(streamIntervalId);
-  
-  // Send payments every 10 seconds (for testing convenience)
-  streamIntervalId = setInterval(async () => {
-    if (!wallet || !isNodeRunning) {
-      clearInterval(streamIntervalId);
-      return;
-    }
-    
-    const rateSatsMin = parseInt(streamRateInput.value, 10);
-    const amountSats = Math.max(1, Math.round((rateSatsMin * 10) / 60));
-    
-    appendLog(`[V4V] Streaming ${amountSats} sats (interval: 10s)...`, "info");
-    
-    // Creator pubkey and App Dev pubkey
-    const creatorPubkey = "02bdafbf7a60765a9ab4673350c1b5954449e290f498d1ff3a77c58eb7cebfbf24";
-    const appDevPubkey = "035c6ec9ffea21051515efbb72d2fb07dfb51fa16d78772cc1c9b6348981f185ef";
-    
-    const destinations = [
-      { destinationPubkey: creatorPubkey, share: 90 },
-      { destinationPubkey: appDevPubkey, share: 10 },
-    ];
-    
-    const splits = calculateSplits({
-      destinations,
-      amountSats,
-      boostRecordTemplate: {
-        action: "stream",
-        app_name: "v4vmusic-player",
-        ts: Math.floor(audioPlayer.currentTime),
-      },
-    });
-    
-    const res = await wallet.sendSplitPayments(splits);
-    if (res.ok) {
-      totalSatsStreamed += amountSats;
-      satsStreamedVal.innerText = totalSatsStreamed.toString();
-      appendLog(`[V4V] Successfully streamed ${amountSats} sats split!`, "info");
-    } else {
-      appendLog(`[V4V] Failed streaming split payment: some recipients failed. Check LDK logs.`, "error");
-    }
-  }, 10000);
-});
-
-const stopStreaming = () => {
-  if (streamIntervalId) {
-    clearInterval(streamIntervalId);
-    streamIntervalId = null;
-  }
-  streamModeStatus.innerText = "Inactive";
-  streamModeStatus.className = "value text-warning";
-  appendLog("[V4V] Audio playback paused/stopped. Stopped streaming micropayments.", "system");
-};
-
-audioPlayer.addEventListener("pause", stopStreaming);
-audioPlayer.addEventListener("ended", stopStreaming);
-audioPlayer.addEventListener("error", stopStreaming);
-
-// 12. Send Boostagram Splits
-sendBoostagramBtn.addEventListener("click", async () => {
-  if (!wallet || !isNodeRunning) return;
-  try {
-    sendBoostagramBtn.disabled = true;
-    const amountSats = parseInt(boostAmountInput.value, 10);
-    const message = boostMessageInput.value.trim();
-    const senderName = boostSenderName.value.trim();
-    
-    appendLog(`[V4V] Preparing Boostagram of ${amountSats} sats with message: "${message}"...`, "system");
-    
-    const creatorPubkey = "02bdafbf7a60765a9ab4673350c1b5954449e290f498d1ff3a77c58eb7cebfbf24";
-    const appDevPubkey = "035c6ec9ffea21051515efbb72d2fb07dfb51fa16d78772cc1c9b6348981f185ef";
-    
-    const destinations = [
-      { destinationPubkey: creatorPubkey, share: 90 },
-      { destinationPubkey: appDevPubkey, share: 10 },
-    ];
-    
-    const splits = calculateSplits({
-      destinations,
-      amountSats,
-      boostRecordTemplate: {
-        action: "boost",
-        app_name: "v4vmusic-player",
-        message,
-        sender_name: senderName,
-        ts: Math.floor(audioPlayer.currentTime),
-      },
-    });
-    
-    const res = await wallet.sendSplitPayments(splits);
-    if (res.ok) {
-      appendLog(`[V4V] Boostagram sent successfully! Total ${amountSats} sats split:`, "info");
-      for (const r of res.results) {
-        const hash = r.result.ok ? r.result.paymentHash : "N/A";
-        appendLog(` -> ${r.destinationPubkey.substring(0, 8)}... gets ${r.amountSats} sats, status: OK, paymentHash: ${hash}`, "info");
-      }
-    } else {
-      appendLog(`[V4V] Failed to send Boostagram: one or more payments failed.`, "error");
-      for (const r of res.results) {
-        const status = r.result.ok ? "OK" : `Error: ${r.result.error}`;
-        appendLog(` -> ${r.destinationPubkey.substring(0, 8)}... gets ${r.amountSats} sats, status: ${status}`, "error");
-      }
-    }
-  } catch (err: any) {
-    appendLog(`[ERROR] Boostagram sending failed: ${err.message}`, "error");
-  } finally {
-    sendBoostagramBtn.disabled = false;
-  }
-});
-
-// 13. Nostr Wallet Connect (NWC) Event Listeners & Helpers
-createNwcBtn.addEventListener("click", async () => {
-  if (!wallet || !isNodeRunning) return;
-  try {
-    createNwcBtn.disabled = true;
-    nwcUriContainer.classList.add("hidden");
-    nwcQrImg.classList.add("hidden");
-
-    const name = nwcConnNameInput.value.trim() || "Nostr Client App";
-    const limit = parseInt(nwcSpendingLimitInput.value, 10) || 0;
-    const relayUrl = nwcRelayUrlInput.value.trim() || "wss://relay.damus.io";
-
-    appendLog(`[NWC] Creating connection pairing: "${name}" with limit: ${limit} sats on relay ${relayUrl}...`, "system");
-    const uri = await wallet.nwc.createConnection(name, {
-      spendingLimitSats: limit,
-      relayUrl,
-    });
-
-    appendLog(`[NWC] Connection created successfully!`, "system");
-    nwcUriStr.value = uri;
-    nwcQrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(uri)}`;
-    nwcQrImg.classList.remove("hidden");
-    nwcUriContainer.classList.remove("hidden");
-
-    await updateNwcConnectionsList();
-  } catch (err: any) {
-    appendLog(`[ERROR] NWC connection creation failed: ${err.message}`, "error");
-  } finally {
-    createNwcBtn.disabled = false;
-  }
-});
-
-copyNwcUriBtn.addEventListener("click", () => {
-  if (!nwcUriStr.value) return;
-  navigator.clipboard.writeText(nwcUriStr.value);
-  appendLog("[SYSTEM] NWC Connection URI copied to clipboard.", "system");
-});
-
-async function updateNwcConnectionsList() {
-  if (!wallet) return;
-  try {
-    const list = await wallet.nwc.listConnections();
-    nwcConnectionsList.innerHTML = "";
-
-    if (list.length === 0) {
-      nwcConnectionsList.innerHTML = '<div class="empty-list-text text-muted" style="font-size: 0.85rem;">No active pairings yet.</div>';
-      return;
-    }
-
-    for (const conn of list) {
-      const item = document.createElement("div");
-      item.className = "connection-item";
-
-      const details = document.createElement("div");
-      details.className = "connection-details";
-
-      const nameEl = document.createElement("div");
-      nameEl.className = "connection-name";
-      nameEl.innerText = conn.name;
-
-      const metaEl = document.createElement("div");
-      metaEl.className = "connection-meta";
-
-      const pubkeyEl = document.createElement("span");
-      pubkeyEl.className = "connection-pubkey";
-      pubkeyEl.innerText = `${conn.clientPubkey.substring(0, 8)}...`;
-      pubkeyEl.title = conn.clientPubkey;
-
-      const limitEl = document.createElement("span");
-      limitEl.className = "connection-limit";
-      const limitStr = conn.spendingLimitSats > 0 
-        ? `Limit: ${conn.spentTodaySats}/${conn.spendingLimitSats} sats`
-        : "Limit: Unlimited";
-      limitEl.innerText = limitStr;
-
-      const relayEl = document.createElement("span");
-      relayEl.className = "connection-relay";
-      relayEl.innerText = `Relay: ${conn.relayUrl}`;
-
-      metaEl.appendChild(pubkeyEl);
-      metaEl.appendChild(limitEl);
-      metaEl.appendChild(relayEl);
-
-      details.appendChild(nameEl);
-      details.appendChild(metaEl);
-
-      const revokeBtn = document.createElement("button");
-      revokeBtn.className = "btn-revoke";
-      revokeBtn.innerText = "Revoke";
-      revokeBtn.addEventListener("click", async () => {
-        try {
-          revokeBtn.disabled = true;
-          appendLog(`[NWC] Revoking connection for ${conn.name}...`, "system");
-          await wallet!.nwc.deleteConnection(conn.clientPubkey);
-          appendLog(`[NWC] Connection revoked.`, "system");
-          await updateNwcConnectionsList();
-        } catch (e: any) {
-          appendLog(`[ERROR] Failed to revoke connection: ${e.message}`, "error");
-          revokeBtn.disabled = false;
-        }
-      });
-
-      item.appendChild(details);
-      item.appendChild(revokeBtn);
-      nwcConnectionsList.appendChild(item);
-    }
-  } catch (err: any) {
-    console.error("Failed to update connections list", err);
-  }
-}
-
-// --- Service Worker & Web Push Registration ---
-const registerPushBtn = document.getElementById("register-push-btn") as HTMLButtonElement;
-const unregisterPushBtn = document.getElementById("unregister-push-btn") as HTMLButtonElement;
-const pushStatusVal = document.getElementById("push-status-val") as HTMLSpanElement;
-const pushGatewayUrlInput = document.getElementById("push-gateway-url") as HTMLInputElement;
-const simulateOfflinePushBtn = document.getElementById("simulate-offline-push-btn") as HTMLButtonElement;
-
-let swRegistration: ServiceWorkerRegistration | null = null;
-
-function urlBase64ToUint8Array(base64String: string) {
-  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding).replace(/\-/g, "+").replace(/_/g, "/");
-  const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-  for (let i = 0; i < rawData.length; ++i) {
-    outputArray[i] = rawData.charCodeAt(i);
-  }
-  return outputArray;
-}
-
-async function initServiceWorker() {
-  if ("serviceWorker" in navigator && "PushManager" in window) {
-    try {
-      appendLog("[SYSTEM] Registering Service Worker...", "system");
-      swRegistration = await navigator.serviceWorker.register("/service-worker.js", { type: "module" });
-      appendLog("[SYSTEM] Service Worker registered successfully!", "system");
-
-      const subscription = await swRegistration.pushManager.getSubscription();
-      if (subscription) {
-        pushStatusVal.innerText = "Registered";
-        pushStatusVal.className = "value text-success";
-        registerPushBtn.disabled = true;
-        unregisterPushBtn.disabled = false;
-      }
-    } catch (e: any) {
-      appendLog(`[ERROR] SW registration failed: ${e.message}`, "error");
-    }
+  const current = wallet.getStateVersion();
+  const lastStr = localStorage.getItem(`libre_last_backup_version_${networkSelect.value}`);
+  const parsed = lastStr === null ? NaN : parseInt(lastStr, 10);
+  const last = Number.isNaN(parsed) ? -1 : parsed;
+  if (last < 0) {
+    backupStatusEl.textContent = "No backup yet — click Download";
+    backupStatusEl.className = "value text-warning";
+  } else if (current > last) {
+    backupStatusEl.textContent = "⚠️ Out of date — click Download";
+    backupStatusEl.className = "value text-warning";
   } else {
-    appendLog("[WARN] Service Worker or Push Notifications are not supported in this browser.", "warn");
-    registerPushBtn.disabled = true;
+    backupStatusEl.textContent = "Up to date ✓";
+    backupStatusEl.className = "value";
+  }
+}
+// Fired by wallet.onStateChanged (registered on node start) — no polling. Refreshes the
+// backup indicator and debounces a Drive auto-upload when channel state advances.
+function onWalletStateChanged(): void {
+  refreshBackupStatus();
+  refreshWalletView();
+  // Once channel state is persisted, this seed is "established" — drop the fresh-create
+  // provenance so a later missing-state situation is correctly flagged (not bypassed).
+  void storage.getItem("channel_manager").then((cm) => { if (cm) void storage.removeItem("wallet_created_new"); });
+  if (!wallet || !isNodeRunning || !drive.isConnected() || driveSyncing) return;
+  if (wallet.getStateVersion() > loadDriveSyncedVersion()) {
+    if (driveSyncTimer) clearTimeout(driveSyncTimer);
+    driveSyncTimer = setTimeout(() => {
+      driveSyncTimer = null;
+      void uploadBackupToDrive();
+    }, 5000);
   }
 }
 
-initServiceWorker();
+// On (re)connecting Drive, push immediately if channel state advanced while we were
+// disconnected — so a state change is never left un-backed-up.
+function maybeCatchUpDriveSync(): void {
+  if (wallet && isNodeRunning && drive.isConnected() && !driveSyncing && wallet.getStateVersion() > loadDriveSyncedVersion()) {
+    void uploadBackupToDrive();
+  }
+}
 
-registerPushBtn.addEventListener("click", async () => {
-  if (!swRegistration || !wallet) {
-    appendLog("[WARN] Start LDK node first to pairing wallet for push registration.", "warn");
+copySeedBtn.addEventListener("click", async () => {
+  const seed = seedInput.value.trim();
+  if (seed.length !== 64) {
+    appendLog("[ERROR] No 64-char seed to copy.", "error");
     return;
   }
-
   try {
-    registerPushBtn.disabled = true;
-    appendLog("[SYSTEM] Requesting notification permission...", "system");
-    const permission = await Notification.requestPermission();
-    if (permission !== "granted") {
-      throw new Error("Notification permission denied");
-    }
-
-    const gatewayUrl = pushGatewayUrlInput.value.trim().replace(/\/$/, "");
-
-    appendLog(`[Push] Fetching VAPID public key from ${gatewayUrl}...`, "info");
-    const vapidRes = await fetch(`${gatewayUrl}/api/vapid-public-key`);
-    if (!vapidRes.ok) throw new Error("Failed to fetch VAPID key");
-    const { publicKey: vapidPubKey } = await vapidRes.json();
-
-    appendLog("[Push] Subscribing via browser PushManager...", "info");
-    const subscription = await swRegistration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(vapidPubKey)
-    });
-
-    const walletPubkey = wallet.nwc.getWalletPubkey();
-    const relayUrl = nwcRelayUrlInput.value.trim();
-
-    appendLog("[Push] Sending subscription details to gateway...", "info");
-    const regRes = await fetch(`${gatewayUrl}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        walletPubkey,
-        relayUrl,
-        subscription
-      })
-    });
-
-    if (!regRes.ok) {
-      throw new Error("Failed to register subscription with gateway");
-    }
-
-    pushStatusVal.innerText = "Registered";
-    pushStatusVal.className = "value text-success";
-    unregisterPushBtn.disabled = false;
-    appendLog("[Push] Web Push Notification wakeup enabled successfully!", "system");
-
-  } catch (err: any) {
-    appendLog(`[ERROR] Push registration failed: ${err.message}`, "error");
-    registerPushBtn.disabled = false;
+    await navigator.clipboard.writeText(seed);
+    appendLog("[SYSTEM] Seed copied to clipboard — store it somewhere safe.", "system");
+  } catch (e) {
+    appendLog(`[ERROR] Copy failed: ${e instanceof Error ? e.message : e}`, "error");
   }
 });
 
-unregisterPushBtn.addEventListener("click", async () => {
-  if (!swRegistration) return;
+// --- Google Drive backup ---
+function updateDriveStatus(text?: string) {
+  if (text) {
+    driveStatusEl.textContent = text;
+  } else {
+    driveStatusEl.textContent = drive.isConnected() ? "connected ✓" : "not connected";
+  }
+  // Reflect connection state on the button itself (label + color), so it's obvious
+  // at a glance — not just the small status text beside it.
+  const view = driveButtonView(drive.isConnected());
+  connectDriveBtn.textContent = view.label;
+  connectDriveBtn.className = view.className;
+}
+
+// Connect Drive, feeding the remembered account email as a login_hint so a silent
+// reconnect on a later load reuses the existing session without a popup. Persists the
+// email after a successful connect for next time. All three connect sites go through this.
+const DRIVE_HINT_KEY = "libre_drive_hint";
+async function connectDrive(clientId: string, opts: { silent?: boolean } = {}): Promise<void> {
+  const hint = localStorage.getItem(DRIVE_HINT_KEY) || undefined;
+  await drive.connect(clientId, { ...opts, hint });
+  const email = drive.getConnectedEmail();
+  if (email) {
+    localStorage.setItem(DRIVE_HINT_KEY, email);
+    appendLog(`[SYSTEM] Drive: remembered ${email} for silent reconnect.`, "system");
+  } else {
+    // No email ⇒ no login_hint next time ⇒ silent reconnect will keep failing.
+    appendLog("[WARN] Drive connected but could not read the account email (userinfo) — silent reconnect won't work. Check the consent screen granted the email permission.", "warn");
+  }
+}
+
+// Client ID is baked in via VITE_GOOGLE_CLIENT_ID (.env.local). If it's missing,
+// connect will report it rather than offering a paste field.
+updateDriveStatus();
+
+connectDriveBtn.addEventListener("click", async () => {
+  const clientId = resolveClientId();
+  if (!clientId) {
+    appendLog("[ERROR] No Google OAuth Client ID configured — set VITE_GOOGLE_CLIENT_ID in packages/example-app/.env.local.", "error");
+    return;
+  }
   try {
-    unregisterPushBtn.disabled = true;
-    const subscription = await swRegistration.pushManager.getSubscription();
-    if (subscription) {
-      await subscription.unsubscribe();
-
-      if (wallet) {
-        const gatewayUrl = pushGatewayUrlInput.value.trim().replace(/\/$/, "");
-        const walletPubkey = wallet.nwc.getWalletPubkey();
-        const relayUrl = nwcRelayUrlInput.value.trim();
-
-        await fetch(`${gatewayUrl}/api/unregister`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ walletPubkey, relayUrl })
-        });
-      }
-    }
-
-    pushStatusVal.innerText = "Not Registered";
-    pushStatusVal.className = "value text-warning";
-    registerPushBtn.disabled = false;
-    appendLog("[Push] Web Push Notification un-registered.", "system");
-
-  } catch (err: any) {
-    appendLog(`[ERROR] Push unregistration failed: ${err.message}`, "error");
-    unregisterPushBtn.disabled = false;
+    updateDriveStatus("connecting…");
+    await connectDrive(clientId);
+    updateDriveStatus();
+    appendLog("[SYSTEM] Connected to Google Drive.", "system");
+    maybeCatchUpDriveSync();
+  } catch (e) {
+    updateDriveStatus("not connected");
+    appendLog(`[ERROR] Google Drive connect failed: ${e instanceof Error ? e.message : e}`, "error");
   }
 });
 
-simulateOfflinePushBtn.addEventListener("click", async () => {
+// Attempt a silent (no-popup) Google Drive re-auth on page load. Succeeds if the user
+// has an active Google session + prior consent; otherwise leaves the manual button.
+async function tryAutoConnectDrive(): Promise<void> {
+  const clientId = resolveClientId();
+  if (!clientId) return;
   try {
-    simulateOfflinePushBtn.disabled = true;
+    updateDriveStatus("connecting…");
+    await connectDrive(clientId, { silent: true });
+    updateDriveStatus();
+    appendLog("[SYSTEM] Auto-connected to Google Drive.", "system");
+    maybeCatchUpDriveSync();
+  } catch (e) {
+    updateDriveStatus("not connected");
+    const hadHint = !!localStorage.getItem(DRIVE_HINT_KEY);
+    const reason = e instanceof Error ? e.message : String(e);
+    appendLog(
+      `[SYSTEM] Google Drive: silent reconnect unavailable (hint=${hadHint ? "set" : "none"}; ${reason}) — retrying on first interaction, or click Connect Drive.`,
+      "system"
+    );
+    armDriveGestureReconnect();
+  }
+}
 
-    const storage = new IndexedDBStorageProvider();
-    const connJson = await storage.getItem("nwc_connections");
-    const connections = connJson ? JSON.parse(connJson) : [];
-    if (connections.length === 0) {
-      throw new Error("Create an NWC Connection (Section 7) first to retrieve active keys.");
-    }
-
-    const conn = connections[connections.length - 1];
-    const clientSecretHex = conn.secret;
-
-    const walletPrivKeyHex = await storage.getItem("nwc_wallet_private_key");
-    if (!walletPrivKeyHex) {
-      throw new Error("Wallet private key not found in storage. Start the node first.");
-    }
-
-    const { getPublicKey: derivePubkey, Relay: NostrRelay, finalizeEvent: nostrFinalize, nip04: nostrNip04 } = await import("nostr-tools");
-
-    const hexToBytesHelper = (hex: string) => {
-      const bytes = new Uint8Array(hex.length / 2);
-      for (let i = 0; i < bytes.length; i++) {
-        bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+// GIS's OAuth token model needs a user gesture to mint a token (a page-load attempt
+// fails with popup_failed_to_open), so the load-time silent reconnect can't work on
+// its own. If we have a remembered account, retry the silent reconnect on the user's
+// FIRST interaction — that gesture satisfies the token flow, reconnecting Drive with
+// no dedicated "Connect Drive" click and (with prompt:'none' + hint) no popup.
+function armDriveGestureReconnect(): void {
+  if (!shouldArmGestureReconnect(drive.isConnected(), localStorage.getItem(DRIVE_HINT_KEY))) return;
+  const onFirstGesture = async () => {
+    window.removeEventListener("pointerdown", onFirstGesture);
+    window.removeEventListener("keydown", onFirstGesture);
+    if (drive.isConnected()) return;
+    const clientId = resolveClientId();
+    if (!clientId) return;
+    try {
+      await connectDrive(clientId, { silent: true });
+      updateDriveStatus();
+      if (drive.isConnected()) {
+        appendLog("[SYSTEM] Auto-connected to Google Drive on first interaction.", "system");
+        maybeCatchUpDriveSync();
       }
-      return bytes;
-    };
+    } catch (e) {
+      // Still no silent token (expired session / blocked cookies) — fall back to the button.
+      appendLog(`[SYSTEM] Google Drive still needs a manual connect (${e instanceof Error ? e.message : e}).`, "system");
+    }
+  };
+  window.addEventListener("pointerdown", onFirstGesture);
+  window.addEventListener("keydown", onFirstGesture);
+}
 
-    const targetPubkey = derivePubkey(hexToBytesHelper(walletPrivKeyHex));
-    const relayUrl = conn.relayUrl;
+// Best-effort: if Drive is connected, sync the seed-encrypted backup and verify
+// it re-downloads + decrypts with the seed. Non-blocking — the seed itself is the
+// primary recovery, so a missing Drive connection just prints a reminder.
+async function createAndVerifyBackup(): Promise<void> {
+  if (!wallet) return;
+  const seedHex = (await storage.getItem("ldk_seed")) || "";
+  try {
+    if (!drive.isConnected()) {
+      appendLog("[SYSTEM] Tip: Connect Google Drive to store an encrypted backup of your channel state.", "system");
+      createWalletStatus.textContent = "Wallet running — connect Drive to back up channel state";
+      return;
+    }
+    const env = await wallet.exportState();
+    await drive.uploadBackup(env, networkSelect.value);
+    const redown = await drive.downloadBackup(networkSelect.value);
+    if (!redown) {
+      appendLog("[WARN] Backup not found in Drive after upload. Your seed is your recovery — keep it safe.", "warn");
+      createWalletStatus.textContent = "⚠️ Drive backup not verified — keep your seed";
+      return;
+    }
+    const res = await wallet.verifyBackup(redown, seedHex);
+    if (res.ok && res.hasSeed && res.seedMatches !== false) {
+      localStorage.setItem(`libre_drive_synced_version_${networkSelect.value}`, String(wallet.getStateVersion()));
+      appendLog("[SYSTEM] ✅ Backup synced to Drive & verified restorable with your seed.", "system");
+      createWalletStatus.textContent = "✅ Backup verified on Drive";
+    } else {
+      appendLog(`[WARN] Drive backup not verified (${res.error ?? "mismatch"}). Your seed is still your recovery — keep it safe.`, "warn");
+      createWalletStatus.textContent = "⚠️ Drive backup not verified — keep your seed";
+    }
+  } catch (e) {
+    appendLog(`[WARN] Drive backup step failed: ${e instanceof Error ? e.message : e}. Your seed is your recovery — keep it safe.`, "warn");
+  }
+}
 
-    appendLog(`[Simulate] Connecting to Nostr relay: ${relayUrl} to publish NWC request...`, "info");
-    const relay = await NostrRelay.connect(relayUrl);
-
-    const requestPayload = {
-      jsonrpc: "2.0",
-      id: "sim-request-" + Math.floor(Math.random() * 100000),
-      method: "get_balance",
-      params: {}
-    };
-
-    appendLog("[Simulate] Encrypting NWC get_balance request payload...", "info");
-    const encryptedContent = await nostrNip04.encrypt(clientSecretHex, targetPubkey, JSON.stringify(requestPayload));
-
-    const event = {
-      kind: 23194,
-      tags: [["p", targetPubkey]],
-      content: encryptedContent,
-      created_at: Math.floor(Date.now() / 1000)
-    };
-
-    const finalizedEvent = nostrFinalize(event, hexToBytesHelper(clientSecretHex));
-
-    appendLog(`[Simulate] Publishing kind 23194 request to relay. Event ID: ${finalizedEvent.id}`, "info");
-    await relay.publish(finalizedEvent);
-    appendLog("[Simulate] Event published successfully! Closing Nostr connection.", "system");
-    await relay.close();
-
-    appendLog("[SYSTEM] Simulated NWC request event published to relay. Waking up background Service Worker...", "system");
-
-  } catch (err: any) {
-    appendLog(`[ERROR] Simulation failed: ${err.message}`, "error");
+async function uploadBackupToDrive(): Promise<void> {
+  if (!wallet || !isNodeRunning) {
+    appendLog("[ERROR] Start the node before backing up to Drive.", "error");
+    return;
+  }
+  if (!drive.isConnected()) {
+    appendLog("[ERROR] Connect Google Drive first.", "error");
+    return;
+  }
+  driveSyncing = true;
+  updateDriveStatus("syncing…");
+  try {
+    const version = wallet.getStateVersion();
+    await drive.uploadBackup(await wallet.exportState(), networkSelect.value);
+    localStorage.setItem(`libre_drive_synced_version_${networkSelect.value}`, String(version));
+    updateDriveStatus(`synced ✓ (v${version})`);
+    appendLog(`[SYSTEM] Backup synced to Google Drive (v${version}).`, "system");
+  } catch (e) {
+    if (e instanceof drive.DriveReconnectError) {
+      updateDriveStatus("reconnect needed");
+      appendLog("[ERROR] Google Drive session expired — click Connect again.", "error");
+    } else {
+      updateDriveStatus("connected ✓");
+      appendLog(`[ERROR] Drive sync failed: ${e instanceof Error ? e.message : e}`, "error");
+    }
   } finally {
-    simulateOfflinePushBtn.disabled = false;
+    driveSyncing = false;
   }
+}
+
+backupDriveNowBtn.addEventListener("click", () => {
+  void uploadBackupToDrive();
 });
 
+
+restoreDriveBtn.addEventListener("click", async () => {
+  const seed = resolveSeedInput(seedInput.value);
+  if (!seed) {
+    appendLog("[ERROR] Paste your 64-hex seed (or 24-word recovery phrase) in the Seed field to decrypt the Drive backup.", "error");
+    return;
+  }
+  if (isNodeRunning) {
+    appendLog("[ERROR] Stop the node before restoring.", "error");
+    return;
+  }
+  try {
+    if (!drive.isConnected()) {
+      const clientId = resolveClientId();
+      if (!clientId) {
+        appendLog("[ERROR] No Google OAuth Client ID configured — set VITE_GOOGLE_CLIENT_ID in .env.local.", "error");
+        return;
+      }
+      await connectDrive(clientId);
+      updateDriveStatus();
+    }
+
+    // Auto-detect the network from the backup(s) in Drive — no need to pre-select it.
+    const networks = await drive.listBackupNetworks();
+    const net = drive.pickRestoreNetwork(networks);
+    if (!net) {
+      appendLog("[SYSTEM] No backup found in your Google Drive.", "system");
+      return;
+    }
+    if (networks.length > 1) {
+      appendLog(`[SYSTEM] Found backups for ${networks.join(", ")} — restoring ${net}.`, "system");
+    }
+
+    // Switch the app to the detected network (fill sync/bridge/peer, swap the wallet DB).
+    networkSelect.value = net;
+    const preset = NETWORK_PRESETS[net];
+    if (preset) {
+      esploraUrlInput.value = preset.esplora;
+      wsBridgeUrlInput.value = preset.bridge;
+      lspConnStrInput.value = preset.peer;
+    }
+    try { localStorage.setItem("libre_ui_network", net); } catch {}
+    updateNetworkBadge();
+    await setActiveNetwork(net);
+    storage = new IndexedDBStorageProvider(dbNameForNetwork(net));
+
+    const blob = await drive.downloadBackup(net);
+    if (!blob) {
+      appendLog("[SYSTEM] No backup found in your Google Drive.", "system");
+      return;
+    }
+    const importWallet = new LibreListenerWallet({
+      config: {
+        network: net as "mainnet" | "testnet" | "regtest" | "signet",
+        esploraUrl: esploraUrlInput.value.trim(),
+      },
+      storage,
+      socketProvider: new BrowserWebSocketStreamProvider(),
+      wasmUrl: `${import.meta.env.BASE_URL}liblightningjs.wasm`,
+    });
+    await importWallet.importState(blob, seed);
+    restoreBanner.classList.add("hidden");
+    appendLog(`[SYSTEM] Backup restored from Google Drive (${net}). Click Start Node to boot the recovered wallet.`, "system");
+  } catch (e) {
+    appendLog(`[ERROR] Restore from Drive failed: ${e instanceof Error ? e.message : e}`, "error");
+  }
+});
 

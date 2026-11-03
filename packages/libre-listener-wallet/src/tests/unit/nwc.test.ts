@@ -6,6 +6,9 @@ import { bytesToHex, hexToBytes } from "../../storage-cache";
 import { nwcRequestSchema } from "@libre/shared";
 import {
   Event_PaymentSent,
+  Event_PaymentFailed,
+  Event_PaymentClaimed,
+  Option_ThirtyTwoBytesZ_Some,
   Bolt11Invoice,
   Option_u64Z_Some,
   UtilMethods,
@@ -45,10 +48,12 @@ beforeAll(async () => {
 const mockPublish = vi.fn();
 const mockSubscribeClose = vi.fn();
 let subHandler: ((event: any) => Promise<void>) | null = null;
+let subCloseHandler: ((reason: string) => void) | null = null;
 
 const mockRelay = {
   subscribe: vi.fn().mockImplementation((filters, handlers) => {
     subHandler = handlers.onevent;
+    subCloseHandler = handlers.onclose;
     return {
       close: mockSubscribeClose,
     };
@@ -76,6 +81,7 @@ describe("Nostr Wallet Connect (NWC) Unit Tests", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     subHandler = null;
+    subCloseHandler = null;
     mockStorage = {};
     storageProvider = {
       getItem: async (key) => mockStorage[key] || null,
@@ -265,7 +271,8 @@ describe("Nostr Wallet Connect (NWC) Unit Tests", () => {
       expect(lastCallEvent!.kind).toBe(23195);
       const responsePlain = await nip04.decrypt(clientSecretHex, walletPubkeyHex, lastCallEvent!.content);
       const responseObj = JSON.parse(responsePlain);
-      expect(responseObj.id).toBe(reqId1);
+      // NIP-47 correlates the response to its request via the `e` tag (request event id).
+      expect(lastCallEvent!.tags).toContainEqual(["e", "evt-1"]);
       expect(responseObj.result.preimage).toBeDefined();
 
       // Check cumulative spending
@@ -332,10 +339,14 @@ describe("Nostr Wallet Connect (NWC) Unit Tests", () => {
       await handlePromise3;
 
       expect(mockPublish).toHaveBeenCalled();
-      const successCall3 = mockPublish.mock.calls[0][0];
+      // Find the kind-23195 response (a payment_sent notification may also publish on settle).
+      const successCall3 = mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === 23195);
+      expect(successCall3).toBeDefined();
       const res3Plain = await nip04.decrypt(clientSecretHex, walletPubkeyHex, successCall3.content);
       const res3Obj = JSON.parse(res3Plain);
-      expect(res3Obj.id).toBe(reqId3);
+      // NIP-47 correlates a response to its request via the `e` tag (the request event id),
+      // not a content `id` field — so assert the tag rather than a (no-longer-emitted) id.
+      expect(successCall3.tags).toContainEqual(["e", "evt-3"]);
       expect(res3Obj.result.preimage).toBeDefined();
 
       // Limit should have reset and now have spent 50 sats
@@ -345,5 +356,936 @@ describe("Nostr Wallet Connect (NWC) Unit Tests", () => {
       // Restore Date.now
       Date.now = originalNow;
     });
+
+    it("does not let concurrent requests exceed the daily limit (no TOCTOU race)", async () => {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+
+      nwc["connections"].push({
+        name: "Race App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 100,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: "wss://relay.test.io",
+      });
+      await nwc["saveConnections"]();
+
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+        send_payment: () => ({ is_ok: () => true }),
+      } as any);
+
+      // Each pay_invoice is worth 60 sats; two of them (120) exceed the 100 cap.
+      vi.spyOn(Bolt11Invoice, "constructor_from_str").mockReturnValue({
+        is_ok: () => true,
+        res: { amount_milli_satoshis: () => Option_u64Z_Some.constructor_some(60000n) },
+      } as any);
+
+      // Distinct payment hash per request so each can resolve independently.
+      const usedHashes: string[] = [];
+      let hashCounter = 0;
+      vi.spyOn(UtilMethods, "constructor_payment_parameters_from_invoice").mockImplementation(() => {
+        const h = new Uint8Array(32);
+        h[0] = ++hashCounter;
+        usedHashes.push(bytesToHex(h));
+        return { is_ok: () => true, res: { get_a: () => h, get_b: () => ({}), get_c: () => ({}) } } as any;
+      });
+      vi.spyOn(Retry, "constructor_attempts").mockReturnValue({} as any);
+
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+
+      const mkEvent = async (id: string) => ({
+        kind: 23194,
+        pubkey: clientPubkeyHex,
+        id: `evt-${id}`,
+        content: await nip04.encrypt(
+          clientSecretHex,
+          walletPubkeyHex,
+          JSON.stringify({ jsonrpc: "2.0", id, method: "pay_invoice", params: { invoice: "lnbc60n..." } })
+        ),
+      });
+      const resolvePayment = (hashHex: string) => {
+        const ev = Object.create(Event_PaymentSent.prototype);
+        ev.payment_hash = hexToBytes(hashHex);
+        ev.payment_preimage = new Uint8Array([7]);
+        wallet["eventListeners"].forEach((l) => l(ev));
+      };
+
+      const e1 = await mkEvent("r1");
+      const e2 = await mkEvent("r2");
+      mockPublish.mockClear();
+      // Fire both concurrently.
+      const p1 = subHandler!(e1);
+      const p2 = subHandler!(e2);
+
+      // Resolve whatever actually got sent (serialized: only the first; racing: both).
+      await new Promise((r) => setTimeout(r, 80));
+      if (usedHashes[0]) resolvePayment(usedHashes[0]);
+      await new Promise((r) => setTimeout(r, 80));
+      if (usedHashes[1]) resolvePayment(usedHashes[1]);
+      await new Promise((r) => setTimeout(r, 80));
+      await Promise.all([p1, p2]);
+
+      const responses = await Promise.all(
+        mockPublish.mock.calls
+          .filter((c) => c[0].kind === 23195)
+          .map(async (c) => JSON.parse(await nip04.decrypt(clientSecretHex, walletPubkeyHex, c[0].content)))
+      );
+      const successes = responses.filter((r) => r.result?.preimage).length;
+      const quota = responses.filter((r) => r.error?.code === "QUOTA_EXCEEDED").length;
+      expect(successes).toBe(1);
+      expect(quota).toBe(1);
+      expect((await nwc.listConnections())[0].spentTodaySats).toBeLessThanOrEqual(100);
+    });
+
+    it("initiates a burst of keysends without blocking each on the previous one's settlement", async () => {
+      // A V4V boost arrives as a burst of pay_keysend requests from ONE client (Alby Go).
+      // The per-client serialization must gate the NEXT request only on the previous one's
+      // budget reservation, NOT its settlement — otherwise later splits wait through each
+      // prior settlement, blow the client's request timeout, and show as "Failed" even though
+      // they settle. Regression guard for that bug.
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+
+      nwc["connections"].push({
+        name: "Boost App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0, // unlimited — isolate the serialization behavior
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: "wss://relay.test.io",
+      });
+      await nwc["saveConnections"]();
+
+      // Each keysend initiates OK but never settles (the `settled` promise the manager awaits
+      // stays pending), simulating an in-flight HTLC.
+      const sendSpy = vi
+        .spyOn(wallet, "sendKeysendPayment")
+        .mockResolvedValue({ ok: true, paymentId: "00", paymentHash: "00" } as any);
+
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+
+      // Two distinct destinations (valid 33-byte compressed pubkeys).
+      const dest1 = "02" + "a".repeat(64);
+      const dest2 = "03" + "b".repeat(64);
+      const mkKeysend = async (id: string, pubkey: string) => ({
+        kind: 23194,
+        pubkey: clientPubkeyHex,
+        id: `evt-${id}`,
+        content: await nip04.encrypt(
+          clientSecretHex,
+          walletPubkeyHex,
+          JSON.stringify({ jsonrpc: "2.0", id, method: "pay_keysend", params: { amount: 2000, pubkey } })
+        ),
+      });
+
+      const e1 = await mkKeysend("k1", dest1);
+      const e2 = await mkKeysend("k2", dest2);
+
+      // Fire both, then wait briefly. Neither settles. With the bug, the second keysend is
+      // never initiated (blocked behind the first's settlement await); with the fix, both are.
+      void subHandler!(e1);
+      void subHandler!(e2);
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(sendSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("acks a keysend on dispatch, returning the preimage without waiting for settlement", async () => {
+      // We own the keysend preimage, so the client is answered as soon as the payment is
+      // irrevocably in flight — a browser LDK node settles a boost burst slower than Alby Go's
+      // request timeout, and waiting for Event_PaymentSent made every boost show "Failed" even
+      // though the async payment_sent notification later confirmed it. The response must NOT
+      // depend on settlement. Regression guard.
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+
+      nwc["connections"].push({
+        name: "Ack App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: "wss://relay.test.io",
+      });
+      await nwc["saveConnections"]();
+
+      // Initiates OK but never settles (no Event_PaymentSent/Failed is ever fired).
+      vi.spyOn(wallet, "sendKeysendPayment").mockResolvedValue({ ok: true, paymentId: "00", paymentHash: "00" } as any);
+
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+
+      const preimageHex = "ab".repeat(32); // client-supplied preimage → echoed back in the response
+      const dest = "02" + "c".repeat(64);
+      const content = await nip04.encrypt(
+        clientSecretHex,
+        walletPubkeyHex,
+        JSON.stringify({ jsonrpc: "2.0", id: "ack-1", method: "pay_keysend", params: { amount: 2000, pubkey: dest, preimage: preimageHex } })
+      );
+
+      mockPublish.mockClear();
+      await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, id: "evt-ack-1", content });
+
+      // A success response is published even though nothing settled.
+      const respCall = mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === 23195);
+      expect(respCall).toBeDefined();
+      const resp = JSON.parse(await nip04.decrypt(clientSecretHex, walletPubkeyHex, respCall.content));
+      expect(resp.result_type).toBe("pay_keysend");
+      expect(resp.result.preimage).toBe(preimageHex);
+      // NIP-47: `error` MUST be present on every response, null on success (not omitted).
+      expect(resp.error).toBeNull();
+    });
+  });
+
+  describe("Spending budget is charged at initiation, not only on synchronous settlement", () => {
+    const RELAY = "wss://relay.test.io";
+
+    async function setupPayable(spendingLimitSats: number) {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+      nwc["connections"].push({
+        name: "Budget App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: RELAY,
+      });
+      await nwc["saveConnections"]();
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+        send_payment: () => ({ is_ok: () => true }),
+      } as any);
+      // A 60-sat invoice.
+      vi.spyOn(Bolt11Invoice, "constructor_from_str").mockReturnValue({
+        is_ok: () => true,
+        res: { amount_milli_satoshis: () => Option_u64Z_Some.constructor_some(60_000n) },
+      } as any);
+      vi.spyOn(UtilMethods, "constructor_payment_parameters_from_invoice").mockReturnValue({
+        is_ok: () => true,
+        res: { get_a: () => new Uint8Array(32), get_b: () => ({}), get_c: () => ({}) },
+      } as any);
+      vi.spyOn(Retry, "constructor_attempts").mockReturnValue({} as any);
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+      const send = async (id: string) => {
+        const content = await nip04.encrypt(
+          clientSecretHex,
+          walletPubkeyHex,
+          JSON.stringify({ jsonrpc: "2.0", id, method: "pay_invoice", params: { invoice: "lnbc60n..." } })
+        );
+        mockPublish.mockClear();
+        await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, content, id: `evt-${id}` });
+        const respCall = mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === 23195);
+        return respCall ? JSON.parse(await nip04.decrypt(clientSecretHex, walletPubkeyHex, respCall.content)) : null;
+      };
+      return { send };
+    }
+
+    it("keeps the charge when the settlement await times out (the payment is still in flight)", async () => {
+      const { send } = await setupPayable(100);
+      // Force the settlement await to reject with the timeout error (payment still in flight).
+      vi.spyOn(nwc as any, "awaitWithTimeout").mockImplementation((...args: any[]) =>
+        Promise.reject(args[2])
+      );
+
+      const resp = await send("to-1");
+      // The client gets NO failure response: the payment is still in flight, so reporting an error
+      // (which strict clients render as "failed") would be wrong — the payment_sent notification
+      // reconciles it on the late settle.
+      expect(resp).toBeNull();
+      // … but the budget IS charged, so a replay/next request can't over-spend the cap.
+      expect((await nwc.listConnections())[0].spentTodaySats).toBe(60);
+
+      // A second 60-sat payment now exceeds the 100 cap and is blocked (the bug let this through).
+      const resp2 = await send("to-2");
+      expect(resp2.error.code).toBe("QUOTA_EXCEEDED");
+      expect((await nwc.listConnections())[0].spentTodaySats).toBe(60);
+    });
+
+    it("refunds the charge when the payment definitively fails", async () => {
+      const { send } = await setupPayable(100);
+      // Force the settlement await to reject as a definitive failure (not the timeout message).
+      vi.spyOn(nwc as any, "awaitWithTimeout").mockImplementation(() =>
+        Promise.reject(new Error("LDK payment execution failed"))
+      );
+
+      const resp = await send("fail-1");
+      expect(resp.error).toBeDefined();
+      // A definitive failure means the money never moved — the optimistic debit is reversed.
+      expect((await nwc.listConnections())[0].spentTodaySats).toBe(0);
+    });
+
+    it("refunds the charge when send_payment fails to initiate", async () => {
+      const { send } = await setupPayable(100);
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+        send_payment: () => ({ is_ok: () => false, err: { toString: () => "no route" } }),
+      } as any);
+
+      const resp = await send("init-1");
+      expect(resp.error).toBeDefined();
+      expect((await nwc.listConnections())[0].spentTodaySats).toBe(0);
+      // The noted-pending history record must be finalized FAILED, not stranded at "pending"
+      // forever: a pre-send RouteNotFound fires no LDK event, so nothing else finalizes it.
+      const records = await wallet.getPayments();
+      expect(records.some((r) => r.status === "pending")).toBe(false);
+      expect(records.some((r) => r.status === "failed")).toBe(true);
+    });
+  });
+
+  describe("Stale request rejection (replay guard)", () => {
+    const RELAY = "wss://relay.test.io";
+    it("ignores a request event whose created_at is older than the freshness window", async () => {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+      nwc["connections"].push({
+        name: "Replay App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: RELAY,
+      });
+      await nwc["saveConnections"]();
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+      } as any);
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+      const content = await nip04.encrypt(
+        clientSecretHex,
+        walletPubkeyHex,
+        JSON.stringify({ jsonrpc: "2.0", id: "old-1", method: "get_info", params: {} })
+      );
+      mockPublish.mockClear();
+      // created_at 10 minutes ago → beyond the 5-minute window → dropped, no response.
+      const staleCreatedAt = Math.floor(Date.now() / 1000) - 600;
+      await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, content, id: "evt-old-1", created_at: staleCreatedAt });
+      expect(mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === 23195)).toBeUndefined();
+
+      // A fresh event (created_at now) IS processed.
+      mockPublish.mockClear();
+      await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, content, id: "evt-fresh-1", created_at: Math.floor(Date.now() / 1000) });
+      expect(mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === 23195)).toBeDefined();
+    });
+  });
+
+  describe("connection cap + expiry pruning", () => {
+    it("allows up to 10 connections and rejects the 11th", async () => {
+      for (let i = 0; i < 10; i++) await nwc.createConnection(`app-${i}`);
+      expect((await nwc.listConnections())).toHaveLength(10);
+      await expect(nwc.createConnection("one-too-many")).rejects.toThrow(/limit reached/i);
+      expect((await nwc.listConnections())).toHaveLength(10);
+    });
+
+    it("prunes an expired pairing, freeing a slot for a new one", async () => {
+      for (let i = 0; i < 9; i++) await nwc.createConnection(`app-${i}`);
+      await nwc.createConnection("expiring", { expiresAt: Date.now() - 1000 }); // already expired → 10 total
+      expect((await nwc.listConnections())).toHaveLength(10);
+      // Creating another prunes the expired one first, so it succeeds (back to 10).
+      await nwc.createConnection("fresh");
+      const conns = await nwc.listConnections();
+      expect(conns).toHaveLength(10);
+      expect(conns.find((c) => c.name === "expiring")).toBeUndefined();
+      expect(conns.find((c) => c.name === "fresh")).toBeDefined();
+    });
+
+    it("prunes expired pairings on init (load)", async () => {
+      await nwc.createConnection("keep");
+      await nwc.createConnection("gone", { expiresAt: Date.now() - 1000 });
+      // Reload from the same storage (simulates a restart).
+      const fresh = new NwcManager(wallet, { logger: undefined, storage: storageProvider, network: "regtest" });
+      await fresh.init();
+      const conns = await fresh.listConnections();
+      expect(conns.find((c) => c.name === "gone")).toBeUndefined();
+      expect(conns.find((c) => c.name === "keep")).toBeDefined();
+    });
+  });
+
+  describe("buildGatewayAuth (push-subscription proof-of-control)", () => {
+    it("signs a fresh kind-27235 event bound to action/relay/endpoint, verifiable under the wallet pubkey", async () => {
+      const { verifyEvent } = await import("nostr-tools");
+      const auth = nwc.buildGatewayAuth("register", "wss://relay.example", "https://push.example/ep");
+      expect(auth.kind).toBe(27235);
+      expect(auth.pubkey).toBe(nwc.getWalletPubkey());
+      expect(auth.tags).toContainEqual(["action", "register"]);
+      expect(auth.tags).toContainEqual(["relay", "wss://relay.example"]);
+      expect(auth.tags).toContainEqual(["endpoint", "https://push.example/ep"]);
+      expect(Math.abs(Math.floor(Date.now() / 1000) - auth.created_at)).toBeLessThan(5);
+      expect(verifyEvent(auth)).toBe(true); // valid id + signature
+    });
+
+    it("omits the endpoint tag for an unregister auth", () => {
+      const auth = nwc.buildGatewayAuth("unregister", "wss://relay.example");
+      expect(auth.tags).toContainEqual(["action", "unregister"]);
+      expect(auth.tags.find((t) => t[0] === "endpoint")).toBeUndefined();
+    });
+  });
+
+  describe("Per-connection controls (expiry / methods / per-payment / renewal)", () => {
+    const RELAY = "wss://relay.test.io";
+
+    // Push a connection with explicit control fields and start the manager. Returns the
+    // client/wallet keys plus a helper to send an encrypted request and read back the
+    // decrypted kind-23195 response payload.
+    async function setup(controls: Partial<any>) {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+      nwc["connections"].push({
+        name: "Controlled App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: RELAY,
+        ...controls,
+      });
+      await nwc["saveConnections"]();
+
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+        send_payment: () => ({ is_ok: () => true }),
+      } as any);
+
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+
+      const send = async (id: string, method: string, params: any) => {
+        const content = await nip04.encrypt(
+          clientSecretHex,
+          walletPubkeyHex,
+          JSON.stringify({ jsonrpc: "2.0", id, method, params })
+        );
+        mockPublish.mockClear();
+        await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, content, id: `evt-${id}` });
+        const respCall = mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === 23195);
+        if (!respCall) return null;
+        return JSON.parse(await nip04.decrypt(clientSecretHex, walletPubkeyHex, respCall.content));
+      };
+
+      return { send };
+    }
+
+    it("rejects any request from an expired connection with UNAUTHORIZED", async () => {
+      const { send } = await setup({ expiresAt: Date.now() - 1000 });
+      const resp = await send("exp-1", "get_info", {});
+      expect(resp.error.code).toBe("UNAUTHORIZED");
+    });
+
+    it("still serves requests before the expiry", async () => {
+      const { send } = await setup({ expiresAt: Date.now() + 60_000 });
+      const resp = await send("exp-2", "get_info", {});
+      expect(resp.result).toBeDefined();
+      expect(resp.error).toBeNull(); // NIP-47: error present, null on success
+    });
+
+    it("blocks a method absent from the allowlist with RESTRICTED", async () => {
+      const { send } = await setup({ allowedMethods: ["make_invoice", "get_balance"] });
+      const resp = await send("m-1", "get_balance", {});
+      expect(resp.result).toBeDefined();
+
+      // Build a well-formed keysend request (schema-valid) that the allowlist must reject.
+      const keysendResp = await send("m-2", "pay_keysend", {
+        pubkey: "02" + "a".repeat(64),
+        amount: 1000,
+      });
+      expect(keysendResp.error.code).toBe("RESTRICTED");
+    });
+
+    it("always permits get_info even with a restrictive allowlist", async () => {
+      const { send } = await setup({ allowedMethods: ["make_invoice"] });
+      const resp = await send("gi-1", "get_info", {});
+      expect(resp.result).toBeDefined();
+      // get_info advertises the permitted (grantable) methods + the always-available
+      // get_info and list_transactions (read-only, never allowlist-gated).
+      expect(resp.result.methods).toEqual(["make_invoice", "get_info", "list_transactions"]);
+    });
+
+    it("permits list_transactions even with a restrictive allowlist and returns mapped history", async () => {
+      const { send } = await setup({ allowedMethods: ["make_invoice"] });
+      vi.spyOn(wallet, "getPayments").mockResolvedValue([
+        { id: "out1", direction: "sent", status: "settled", amountSats: 1000, feeSats: 2, timestamp: 1_700_000_000_000, settledAt: 1_700_000_001_000, note: "Boost" },
+        { id: "in1", direction: "received", status: "settled", amountSats: 500, timestamp: 1_700_000_100_000 },
+      ]);
+      const resp = await send("lt-1", "list_transactions", {});
+      expect(resp.error).toBeNull(); // NIP-47: error present, null on success
+      expect(resp.result_type).toBe("list_transactions");
+      const txs = resp.result.transactions;
+      // newest first
+      expect(txs.map((t: any) => t.payment_hash)).toEqual(["in1", "out1"]);
+      const out = txs.find((t: any) => t.payment_hash === "out1");
+      expect(out.type).toBe("outgoing");
+      expect(out.amount).toBe(1_000_000); // msat
+      expect(out.fees_paid).toBe(2_000);
+      expect(out.created_at).toBe(1_700_000_000);
+      expect(out.settled_at).toBe(1_700_000_001);
+      expect(out.description).toBe("Boost");
+      expect(txs.find((t: any) => t.payment_hash === "in1").type).toBe("incoming");
+    });
+
+    it("get_balance counts only usable channels (not a ready-but-peer-offline one)", async () => {
+      const { send } = await setup({});
+      // Two channels: one usable (100k sat outbound), one ready-but-not-usable (peer offline, 50k).
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [
+          { get_is_usable: () => true, get_outbound_capacity_msat: () => 100_000_000n },
+          { get_is_usable: () => false, get_outbound_capacity_msat: () => 50_000_000n },
+        ],
+      } as any);
+      const resp = await send("gb-1", "get_balance", {});
+      // Only the usable channel's 100k sats (100_000_000 msat) is reported.
+      expect(resp.result.balance).toBe(100_000_000);
+    });
+
+    it("prunes expired invoice contexts when a new invoice is created (no unbounded growth)", async () => {
+      const { send } = await setup({});
+      // Seed an already-expired context directly.
+      nwc["invoiceContexts"].set("deadbeef", { clientPubkey: "x", relayUrl: RELAY, expiresAt: Math.floor(Date.now() / 1000) - 10 });
+      expect(nwc["invoiceContexts"].size).toBe(1);
+      // Creating a new invoice prunes the expired one and adds the fresh one.
+      (wallet as any).channelManager = {};
+      vi.spyOn(UtilMethods, "constructor_create_invoice_from_channelmanager_with_payment_hash").mockReturnValue({
+        is_ok: () => true, res: { to_str: () => "lnbc10u1pfake" },
+      } as any);
+      vi.spyOn(Bolt11Invoice, "constructor_from_str").mockReturnValue({
+        is_ok: () => true, res: { payment_hash: () => new Uint8Array(32).fill(1) },
+      } as any);
+      await send("mk-prune", "make_invoice", { amount: 1000, description: "x" });
+      expect(nwc["invoiceContexts"].has("deadbeef")).toBe(false); // expired one pruned
+    });
+
+    it("filters list_transactions by type", async () => {
+      const { send } = await setup({});
+      vi.spyOn(wallet, "getPayments").mockResolvedValue([
+        { id: "out1", direction: "sent", status: "settled", amountSats: 1000, timestamp: 1 },
+        { id: "in1", direction: "received", status: "settled", amountSats: 500, timestamp: 2 },
+      ]);
+      const resp = await send("lt-2", "list_transactions", { type: "incoming" });
+      expect(resp.result.transactions.map((t: any) => t.payment_hash)).toEqual(["in1"]);
+    });
+
+    it("rejects a payment above the per-payment cap even when the budget allows it", async () => {
+      // Budget is generous (unlimited) but a single payment is capped at 500 sats.
+      const { send } = await setup({ maxAmountSats: 500 });
+      vi.spyOn(Bolt11Invoice, "constructor_from_str").mockReturnValue({
+        is_ok: () => true,
+        res: { amount_milli_satoshis: () => Option_u64Z_Some.constructor_some(1_000_000n) }, // 1000 sats
+      } as any);
+
+      const resp = await send("pp-1", "pay_invoice", { invoice: "lnbc1000n..." });
+      expect(resp.error.code).toBe("QUOTA_EXCEEDED");
+      expect(resp.error.message).toContain("per-payment");
+    });
+
+    it("weekly renewal does not reset the budget before 7 days have passed", async () => {
+      // Spent 60 of a 100-sat weekly budget, 2 days ago. A 60-sat payment now (120 total)
+      // must be blocked — the weekly window has not elapsed, so the budget hasn't reset.
+      const twoDaysAgo = Date.now() - 2 * 24 * 60 * 60 * 1000;
+      const { send } = await setup({
+        spendingLimitSats: 100,
+        spentTodaySats: 60,
+        lastSpentTimestamp: twoDaysAgo,
+        budgetRenewal: "weekly",
+      });
+      vi.spyOn(Bolt11Invoice, "constructor_from_str").mockReturnValue({
+        is_ok: () => true,
+        res: { amount_milli_satoshis: () => Option_u64Z_Some.constructor_some(60_000n) }, // 60 sats
+      } as any);
+
+      const resp = await send("wk-1", "pay_invoice", { invoice: "lnbc60n..." });
+      expect(resp.error.code).toBe("QUOTA_EXCEEDED");
+      expect(resp.error.message).toBe("Spending budget exceeded");
+    });
+  });
+
+  describe("createConnection persists the new control fields", () => {
+    it("stores budgetRenewal, maxAmountSats, allowedMethods and expiresAt when provided", async () => {
+      const expiresAt = Date.now() + 86_400_000;
+      await nwc.createConnection("Full App", {
+        spendingLimitSats: 5000,
+        budgetRenewal: "monthly",
+        maxAmountSats: 1000,
+        allowedMethods: ["make_invoice", "get_balance"],
+        expiresAt,
+      });
+      const conn = (await nwc.listConnections()).find((c) => c.name === "Full App")!;
+      expect(conn.budgetRenewal).toBe("monthly");
+      expect(conn.maxAmountSats).toBe(1000);
+      expect(conn.allowedMethods).toEqual(["make_invoice", "get_balance"]);
+      expect(conn.expiresAt).toBe(expiresAt);
+    });
+
+    it("omits the new fields for a legacy-style connection (keeps the old shape)", async () => {
+      await nwc.createConnection("Legacy App", { spendingLimitSats: 1000 });
+      const conn = (await nwc.listConnections()).find((c) => c.name === "Legacy App")!;
+      expect(conn.budgetRenewal).toBeUndefined();
+      expect(conn.maxAmountSats).toBeUndefined();
+      expect(conn.allowedMethods).toBeUndefined();
+      expect(conn.expiresAt).toBeUndefined();
+    });
+  });
+
+  describe("make_invoice response — no preimage leak (guardrail)", () => {
+    it("does not include the unpaid-invoice preimage in the make_invoice response", async () => {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+
+      nwc["connections"].push({
+        name: "Invoice App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: "wss://relay.test.io",
+      });
+      await nwc["saveConnections"]();
+
+      // buildInvoice reads the private channelManager field; createInvoice persists the preimage.
+      (wallet as any).channelManager = {};
+      vi.spyOn(UtilMethods, "constructor_create_invoice_from_channelmanager_with_payment_hash").mockReturnValue({
+        is_ok: () => true,
+        res: { to_str: () => "lnbc10u1pfakeinvoice" },
+      } as any);
+      // make_invoice re-parses the created invoice to report its payment_hash.
+      vi.spyOn(Bolt11Invoice, "constructor_from_str").mockReturnValue({
+        is_ok: () => true,
+        res: { payment_hash: () => new Uint8Array(32) },
+      } as any);
+
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+      const payload = JSON.stringify({
+        jsonrpc: "2.0",
+        id: "mk-1",
+        method: "make_invoice",
+        params: { amount: 1000000, description: "test" },
+      });
+      const encrypted = await nip04.encrypt(clientSecretHex, walletPubkeyHex, payload);
+      mockPublish.mockClear();
+      await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, content: encrypted, id: "evt-mk-1" });
+
+      const respCall = mockPublish.mock.calls.find((c) => c[0].kind === 23195)?.[0];
+      expect(respCall).toBeDefined();
+      const plain = await nip04.decrypt(clientSecretHex, walletPubkeyHex, respCall!.content);
+      const obj = JSON.parse(plain);
+      // The invoice + payment_hash are returned, but the preimage (a claim secret for
+      // an as-yet-unpaid invoice) must NOT be sent over the relay.
+      expect(obj.result.invoice).toBe("lnbc10u1pfakeinvoice");
+      expect(obj.result.payment_hash).toBeDefined();
+      expect(obj.result.preimage).toBeUndefined();
+    });
+  });
+
+  describe("NIP-47 Notifications (payment_sent)", () => {
+    const RELAY = "wss://relay.test.io";
+
+    // Push a connection with a known secret, mock the channel manager, and start so a
+    // relay (mockRelay) is connected. Returns the client/wallet keys for de/encryption.
+    async function setupConnAndStart() {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+      nwc["connections"].push({
+        name: "Notif App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: RELAY,
+      });
+      await nwc["saveConnections"]();
+      const mockChannelManager = {
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+      };
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue(mockChannelManager as any);
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+      return { clientSecretHex, clientPubkeyHex, walletPubkeyHex: nwc["walletPubkey"]! };
+    }
+
+    const fireSent = (hashHex: string, preimageHex: string) => {
+      const ev = Object.create(Event_PaymentSent.prototype);
+      ev.payment_hash = hexToBytes(hashHex);
+      ev.payment_preimage = hexToBytes(preimageHex);
+      wallet["eventListeners"].forEach((l: any) => l(ev));
+    };
+
+    const fireFailed = (hashHex: string) => {
+      const ev = Object.create(Event_PaymentFailed.prototype);
+      ev.payment_hash = Option_ThirtyTwoBytesZ_Some.constructor_some(hexToBytes(hashHex));
+      wallet["eventListeners"].forEach((l: any) => l(ev));
+    };
+
+    const fireClaimed = (hashHex: string, amountMsat: bigint) => {
+      const ev = Object.create(Event_PaymentClaimed.prototype);
+      ev.payment_hash = hexToBytes(hashHex);
+      ev.amount_msat = amountMsat;
+      wallet["eventListeners"].forEach((l: any) => l(ev));
+    };
+
+    const findKind = (kind: number) =>
+      mockPublish.mock.calls.map((c) => c[0]).find((e: any) => e.kind === kind);
+
+    it("publishes a kind-23196 payment_sent notification to the initiating client on settle", async () => {
+      const { clientSecretHex, clientPubkeyHex, walletPubkeyHex } = await setupConnAndStart();
+      const hashHex = bytesToHex(new Uint8Array(32).fill(9));
+      const preimageHex = bytesToHex(new Uint8Array(32).fill(7));
+
+      // Simulate the request handler having registered the initiating client for this hash.
+      nwc["paymentContexts"].set(hashHex, { clientPubkey: clientPubkeyHex, relayUrl: RELAY, amountMsat: 5000 });
+
+      fireSent(hashHex, preimageHex);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const notif = findKind(23196);
+      expect(notif).toBeDefined();
+      expect(notif.tags).toContainEqual(["p", clientPubkeyHex]);
+      const plain = await nip04.decrypt(clientSecretHex, walletPubkeyHex, notif.content);
+      const obj = JSON.parse(plain);
+      expect(obj.notification_type).toBe("payment_sent");
+      expect(obj.notification.payment_hash).toBe(hashHex);
+      expect(obj.notification.preimage).toBe(preimageHex);
+      expect(obj.notification.amount).toBe(5000);
+      // Settlement context is one-shot — cleared after notifying.
+      expect(nwc["paymentContexts"].has(hashHex)).toBe(false);
+    });
+
+    it("advertises the notifications capability in the kind-13194 info event", async () => {
+      await setupConnAndStart();
+      const info = findKind(13194);
+      expect(info).toBeDefined();
+      expect(info.content).toContain("notifications");
+      expect(info.tags).toContainEqual(["notifications", "payment_sent payment_received"]);
+    });
+
+    it("advertises notifications in the get_info result", async () => {
+      const { clientSecretHex, clientPubkeyHex, walletPubkeyHex } = await setupConnAndStart();
+      const payload = JSON.stringify({ jsonrpc: "2.0", id: "gi-1", method: "get_info", params: {} });
+      const enc = await nip04.encrypt(clientSecretHex, walletPubkeyHex, payload);
+      await subHandler!({ kind: 23194, pubkey: clientPubkeyHex, content: enc, id: "gi-evt" });
+
+      const resp = findKind(23195);
+      expect(resp).toBeDefined();
+      const obj = JSON.parse(await nip04.decrypt(clientSecretHex, walletPubkeyHex, resp.content));
+      expect(obj.result.notifications).toContain("payment_sent");
+      expect(obj.result.notifications).toContain("payment_received");
+    });
+
+    it("publishes a kind-23196 payment_received notification when a tracked invoice is claimed", async () => {
+      const { clientSecretHex, clientPubkeyHex, walletPubkeyHex } = await setupConnAndStart();
+      const hashHex = bytesToHex(new Uint8Array(32).fill(5));
+      // Simulate make_invoice having recorded which client owns this invoice.
+      nwc["invoiceContexts"].set(hashHex, { clientPubkey: clientPubkeyHex, relayUrl: RELAY, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+
+      fireClaimed(hashHex, 7000n);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const notif = findKind(23196);
+      expect(notif).toBeDefined();
+      expect(notif.tags).toContainEqual(["p", clientPubkeyHex]);
+      const obj = JSON.parse(await nip04.decrypt(clientSecretHex, walletPubkeyHex, notif.content));
+      expect(obj.notification_type).toBe("payment_received");
+      expect(obj.notification.payment_hash).toBe(hashHex);
+      expect(obj.notification.amount).toBe(7000);
+      expect(nwc["invoiceContexts"].has(hashHex)).toBe(false);
+    });
+
+    it("does not notify on a claim for an untracked invoice (not created via this NWC client)", async () => {
+      await setupConnAndStart();
+      fireClaimed(bytesToHex(new Uint8Array(32).fill(8)), 1000n);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(findKind(23196)).toBeUndefined();
+    });
+
+    it("publishes no notification and clears context on payment failure", async () => {
+      const { clientPubkeyHex } = await setupConnAndStart();
+      const hashHex = bytesToHex(new Uint8Array(32).fill(3));
+      nwc["paymentContexts"].set(hashHex, { clientPubkey: clientPubkeyHex, relayUrl: RELAY, amountMsat: 5000 });
+
+      fireFailed(hashHex);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(findKind(23196)).toBeUndefined();
+      expect(nwc["paymentContexts"].has(hashHex)).toBe(false);
+    });
+  });
+
+  describe("awaitWithTimeout (settlement-await safety valve)", () => {
+    it("resolves with the value when the promise settles before the timeout", async () => {
+      const v = await nwc["awaitWithTimeout"](Promise.resolve("preimage"), 1000, new Error("timed out"));
+      expect(v).toBe("preimage");
+    });
+
+    it("rejects with the timeout error when the promise hangs past the deadline", async () => {
+      await expect(
+        nwc["awaitWithTimeout"](new Promise(() => {}), 20, new Error("payment still in flight"))
+      ).rejects.toThrow("payment still in flight");
+    });
+  });
+
+  describe("Relay resilience (request dedup + reconnect-on-drop)", () => {
+    const RELAY = "wss://relay.test.io";
+
+    function pushConnAndMockMgr() {
+      const clientSecretBytes = generateSecretKey();
+      const clientSecretHex = bytesToHex(clientSecretBytes);
+      const clientPubkeyHex = getPublicKey(clientSecretBytes);
+      nwc["connections"].push({
+        name: "Resilience App",
+        clientPubkey: clientPubkeyHex,
+        secret: clientSecretHex,
+        spendingLimitSats: 0,
+        spentTodaySats: 0,
+        lastSpentTimestamp: Date.now(),
+        createdAt: Date.now(),
+        enabled: true,
+        relayUrl: RELAY,
+      });
+      vi.spyOn(wallet, "getChannelManager").mockReturnValue({
+        current_best_block: () => ({ get_height: () => 100, get_block_hash: () => new Uint8Array(32) }),
+        get_our_node_id: () => new Uint8Array(33),
+        list_channels: () => [],
+      } as any);
+      return { clientSecretHex, clientPubkeyHex };
+    }
+
+    // A relay can deliver the same request event more than once (redelivery on
+    // resubscribe after a reconnect). Processing it twice would, for a payment,
+    // pay twice — so a duplicate event id must be handled at most once.
+    it("processes a duplicate request (same event id) only once", async () => {
+      const { clientSecretHex, clientPubkeyHex } = pushConnAndMockMgr();
+      await nwc["saveConnections"]();
+      await nwc.start();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const walletPubkeyHex = nwc["walletPubkey"]!;
+      const enc = await nip04.encrypt(
+        clientSecretHex,
+        walletPubkeyHex,
+        JSON.stringify({ jsonrpc: "2.0", id: "dup-1", method: "get_info", params: {} })
+      );
+      const event = { kind: 23194, pubkey: clientPubkeyHex, content: enc, id: "evt-dup-1" };
+
+      mockPublish.mockClear();
+      await subHandler!(event);
+      await subHandler!(event); // same id again
+
+      const responses = mockPublish.mock.calls.map((c) => c[0]).filter((e: any) => e.kind === 23195);
+      expect(responses).toHaveLength(1);
+    });
+
+    it("redials a dropped relay with backoff while active, and stop() cancels pending redials", async () => {
+      vi.useFakeTimers();
+      try {
+        pushConnAndMockMgr();
+        await nwc["saveConnections"]();
+        await nwc.start();
+        // Flush the initial connectRelay() microtask chain (connect → publish → subscribe).
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+
+        const relayConnect = vi.mocked(Relay.connect);
+        const afterStart = relayConnect.mock.calls.length;
+        expect(afterStart).toBeGreaterThanOrEqual(1);
+        expect(subCloseHandler).not.toBeNull();
+
+        // The relay connection drops.
+        subCloseHandler!("connection closed");
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        // No immediate redial — it waits for the backoff window.
+        expect(relayConnect.mock.calls.length).toBe(afterStart);
+
+        // After the first backoff (1000ms) it reconnects.
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(relayConnect.mock.calls.length).toBe(afterStart + 1);
+
+        // Drop again, then stop before the next backoff elapses → no further redial.
+        subCloseHandler!("connection closed");
+        await nwc.stop();
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(relayConnect.mock.calls.length).toBe(afterStart + 1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+});
+
+describe("NWC request schema — pay_keysend pubkey validation", () => {
+  // A Lightning node pubkey is a 33-byte compressed key = 66 hex chars (02/03 prefix),
+  // NOT a 32-byte (64-hex) Nostr key. Regression: the regex was {64} and rejected all keysends.
+  const lnPubkey = "028ea4e01d6f7e6d80d2d6902eda9304c4bcda78a6abfda3dee2de94ef46a302d5";
+
+  it("accepts a 66-char compressed Lightning pubkey", () => {
+    const res = nwcRequestSchema.safeParse({
+      method: "pay_keysend",
+      params: { pubkey: lnPubkey, amount: 5000 },
+    });
+    expect(res.success).toBe(true);
+  });
+
+  it("rejects a 64-char (Nostr-style) pubkey for keysend", () => {
+    const res = nwcRequestSchema.safeParse({
+      method: "pay_keysend",
+      params: { pubkey: lnPubkey.slice(2), amount: 5000 },
+    });
+    expect(res.success).toBe(false);
   });
 });

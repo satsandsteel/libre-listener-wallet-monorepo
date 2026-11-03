@@ -10,6 +10,11 @@ export default defineConfig({
   sourcemap: true,
   clean: false,
   platform: "browser",
-  noExternal: ["@libre/listener-wallet", "@libre/shared", "lightningdevkit", "nostr-tools", "zod"],
+  // Everything the SW needs must be BUNDLED — a browser ServiceWorker can't resolve bare
+  // specifiers. @scure/base (pulled in via nostr-tools) must be here or the SW fails to
+  // evaluate ("ServiceWorker script evaluation failed").
+  // @scure/bip39 is pulled in via the SDK's seed-phrase module (BIP39 recovery-phrase support);
+  // it MUST be bundled or the service worker dies with "ServiceWorker script evaluation failed".
+  noExternal: ["@libre/listener-wallet", "@libre/shared", "lightningdevkit", "nostr-tools", "zod", "@scure/base", "@scure/bip39"],
   external: ["crypto"]
 });

@@ -6,11 +6,18 @@
   "scripts": {
     "build": "turbo run build",
     "test": "turbo run test",
-    "lint": "turbo run lint"
+    "lint": "turbo run lint",
+    "check:storage": "pnpm --filter @libre/wallet-core... build && pnpm --filter @libre/wallet-core exec vitest run src/storage-contract.test.ts && pnpm --filter @libre/listener-wallet exec vitest run src/tests/unit/storage-contract.test.ts && pnpm --filter @libre/example-app exec vitest run src/core/storage-contract.test.ts && pnpm --filter @libre/browser-extension exec vitest run src/core/storage-contract.test.ts && pnpm --filter @libre/wallet-pwa exec vitest run src/core/storage-contract.test.ts",
+    "prepare": "husky"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "eslint": "^9.39.4",
+    "globals": "^15.15.0",
+    "husky": "^9.1.7",
     "turbo": "^2.0.4",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.62.1"
   },
   "msw": {
     "workerDirectory": [

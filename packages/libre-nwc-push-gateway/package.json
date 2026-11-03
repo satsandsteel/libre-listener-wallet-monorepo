@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run"
+    "start": "node server.cjs",
+    "test": "vitest run",
+    "lint": "eslint src"
   },
   "dependencies": {
     "@libre/shared": "workspace:*",

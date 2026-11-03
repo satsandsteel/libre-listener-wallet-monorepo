@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      Content-Security-Policy: 'wasm-unsafe-eval' for the LDK WASM; connect-src is intentionally the
+      broad 'self' https: wss: form (it still blocks ftp:/data: exfil and non-TLS plaintext) because
+      the app legitimately dials many https/wss hosts at runtime (esplora, the ws-bridge, Nostr
+      relays, the push gateway, RGS, Google Drive) and a wrong host allowlist silently breaks
+      payments. script-src/frame-src allow Google Identity Services (drive backup loads its remote
+      script). Vite injects inline <style> (style-src 'unsafe-inline'); QRs are data:/blob: images.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://accounts.google.com; connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; worker-src 'self' blob:; frame-src https://accounts.google.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>Libre Wallet</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Libre Wallet" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon-180.png" />
+    <link rel="icon" href="icons/icon-192.png" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- ══════════ HOME (root screen) ══════════ -->
+      <section class="screen current" id="screen-home">
+        <div class="topbar">
+          <button class="iconbtn" id="btn-drawer" aria-label="Menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h10M4 17h16"/></svg>
+          </button>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="home-center">
+          <div class="wallet-name">Libre</div>
+          <div class="balance"><span id="balance-sats">—</span><span class="unit">sats</span></div>
+          <div class="fiat hidden" id="balance-fiat"></div>
+          <div class="fiat hidden" id="balance-recovering"></div>
+          <div class="boot-loading hidden" id="boot-loading"><span class="spinner"></span><span>Starting your node…</span></div>
+          <button class="status-pill hidden" id="status-pill"><span class="pill-dot"></span><span id="status-pill-text"></span></button>
+          <button class="bg-chip hidden" id="bg-mode-chip">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+            <span id="bg-mode-text"></span>
+          </button>
+        </div>
+        <div class="home-bottom">
+          <button class="chevron-hint" id="btn-sheet" aria-label="Show transactions">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 15l6-6 6 6"/></svg>
+          </button>
+          <div class="actions">
+            <button class="action-big" id="btn-receive">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v14m0 0l-6-6m6 6l6-6"/></svg>
+              Receive
+            </button>
+            <button class="action-big" id="btn-send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V6m0 0l-6 6m6-6l6 6"/></svg>
+              Send
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════ NODE ══════════ -->
+      <section class="screen" id="screen-node">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Lightning node</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="order-card">
+            <div class="order-row"><span>Status</span><b id="node-status">—</b></div>
+            <div class="order-row"><span>Network</span><b id="node-network">—</b></div>
+            <div class="order-row"><span>Peers</span><b id="node-peers">—</b></div>
+          </div>
+          <div class="field-label">Node ID</div>
+          <div class="mono-box" id="node-id">(start the node to load)</div>
+          <div class="gap-10"></div>
+          <button class="btn-ghost" id="copy-node-id">Copy node ID</button>
+          <p class="center-note">Share your node ID so another node can open a channel to your wallet.</p>
+          <div class="field-label">Node name</div>
+          <input class="field" id="node-alias" autocomplete="off" maxlength="32" placeholder="e.g. Chad's phone wallet" />
+          <p class="center-note" style="text-align:left;padding:4px 2px">Shown to nodes you connect to instead of "Unknown" once you share a channel. Applies the next time the node starts.</p>
+          <button class="btn-ghost" id="save-node-alias">Save name</button>
+          <p class="msg" id="node-alias-msg"></p>
+          <label class="toggle-row"><input type="checkbox" id="auto-start" /> Start the node automatically when the app opens</label>
+          <div class="gap-10"></div>
+          <button class="btn-primary" id="node-toggle">Start node</button>
+          <p class="msg" id="node-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ RECEIVE ══════════ -->
+      <section class="screen" id="screen-receive">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Receive</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="amount-display">
+            <div class="amount-chip">
+              <input id="recv-amount" inputmode="numeric" autocomplete="off" value="5,000" aria-label="Amount in sats" />
+              <span class="unit">sats</span>
+              <button class="amount-pencil" id="recv-amount-edit" aria-label="Edit amount">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l4-1L20 7.5a2.1 2.1 0 00-3-3L5.5 16 4 20z"/></svg>
+              </button>
+            </div>
+          </div>
+          <p class="center-note">Lightning invoice · expires in 24h</p>
+          <div class="qr-wrap"><img id="invoice-qr" class="qr hidden" alt="Invoice QR" /></div>
+          <textarea id="invoice-out" class="field mono hidden" readonly rows="3"></textarea>
+          <div class="gap-10"></div>
+          <button class="btn-ghost hidden" id="copy-invoice">Copy invoice</button>
+          <p class="center-note hidden" id="reserve-hint"></p>
+          <p class="msg" id="receive-msg"></p>
+        </div>
+        <!-- Full-cover confirmation shown when the displayed invoice gets paid -->
+        <div class="result-cover hidden" id="recv-result" aria-live="polite">
+          <div class="result-inner">
+            <div class="result-badge">
+              <svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+            </div>
+            <div class="result-amount" id="recv-result-amount"></div>
+            <div class="result-title">Payment received</div>
+            <p class="result-note">Your invoice was paid — the sats are in your wallet.</p>
+          </div>
+          <button class="btn-primary" id="recv-result-done">Done</button>
+        </div>
+      </section>
+
+      <!-- ══════════ SEND (wired in a later step) ══════════ -->
+      <section class="screen" id="screen-send">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Send</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="field-label">Invoice or Lightning Address</div>
+          <textarea class="field mono" id="send-input" placeholder="lnbc… or artist@getalby.com" rows="3"></textarea>
+          <div id="send-amount-row" class="hidden">
+            <div class="field-label">Amount (sats)</div>
+            <input class="field" id="send-amount" inputmode="numeric" placeholder="1000" />
+          </div>
+          <div class="gap-18"></div>
+          <button class="btn-primary" id="send-pay">Pay</button>
+          <p class="msg" id="send-msg"></p>
+        </div>
+        <!-- Full-cover confirmation shown after a send (success or in-flight) -->
+        <div class="result-cover hidden" id="send-result" aria-live="polite">
+          <div class="result-inner">
+            <div class="result-badge" id="send-result-badge">
+              <svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+              <svg class="ic-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+            </div>
+            <div class="result-amount" id="send-result-amount"></div>
+            <div class="result-title" id="send-result-title"></div>
+            <p class="result-note" id="send-result-note"></p>
+          </div>
+          <button class="btn-primary" id="send-result-done">Done</button>
+        </div>
+      </section>
+
+      <!-- ══════════ GET A CHANNEL ══════════ -->
+      <section class="screen" id="screen-get-channel">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title" id="gc-title">Get a channel</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="order-card">
+            <div class="order-row"><span>Channel size</span><b id="qc-size">150,000 sats</b></div>
+            <div class="order-row"><span>Provider</span><b id="qc-provider">—</b></div>
+            <div class="order-row"><span>Lease</span><b>~3 months</b></div>
+            <div class="order-row total"><span>Opening fee</span><b id="qc-fee">…</b></div>
+          </div>
+          <p class="center-note">Pay this invoice from another wallet to open your channel. Nothing is spent until you pay it.</p>
+          <div class="qr-wrap"><img id="quick-channel-qr" class="qr hidden" alt="Channel order invoice QR" /></div>
+          <textarea id="quick-channel-invoice" class="field mono hidden" readonly rows="3"></textarea>
+          <div class="gap-10"></div>
+          <button class="btn-ghost hidden" id="quick-channel-copy">Copy invoice</button>
+          <p class="msg" id="quick-channel-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ CHANNEL READY ══════════ -->
+      <section class="screen" id="screen-chan-success">
+        <div class="success-body">
+          <div class="emblem logo-mark"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M13 3L4 14h6l-1 7 9-11h-6l1-7z"/></svg></div>
+          <h1>Channel ready ⚡</h1>
+          <p>Your channel is open — you're on the Lightning Network.</p>
+          <p>Heads up: your balance is still <b>0 sats</b>. That payment covered the channel opening fee, not your wallet. Add some sats to start boosting.</p>
+        </div>
+        <div class="success-foot">
+          <button class="btn-primary" id="chan-receive-btn">Fund wallet</button>
+          <button class="btn-ghost" id="chan-later-btn">Later</button>
+        </div>
+      </section>
+
+      <!-- ══════════ RESTORE ══════════ -->
+      <section class="screen" id="screen-restore">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Restore wallet</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="field-label">Recovery seed (24 words or 64-hex)</div>
+          <input class="field mono" id="restore-secret" autocomplete="off" placeholder="seed phrase or hex seed" />
+          <p class="center-note" style="text-align:left;padding:8px 2px">Your seed decrypts the backup. To recover channels and funds you also need a backup — from Google Drive, a file, or pasted JSON.</p>
+          <div class="gap-10"></div>
+          <button class="btn-primary" id="restore-drive">Restore from Google Drive</button>
+          <div class="gap-10"></div>
+          <input type="file" id="restore-file" accept="application/json,.json" class="file-input" />
+          <button class="btn-ghost" id="restore-file-btn">Restore from backup file</button>
+          <details class="adv">
+            <summary>Paste backup JSON instead</summary>
+            <textarea class="field mono" id="restore-env" rows="4" placeholder="encrypted backup JSON"></textarea>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="restore-confirm">Restore from pasted backup</button>
+          </details>
+          <details class="adv">
+            <summary>Seed-only restore (no backup — empty wallet)</summary>
+            <p class="center-note" style="text-align:left">Only for a seed that never had a channel. A funded seed restored this way will force-close its channel.</p>
+            <button class="btn-ghost" id="restore-seed-only">Restore from seed only</button>
+          </details>
+          <p class="msg" id="restore-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ CHANNELS ══════════ -->
+      <section class="screen" id="screen-channels">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Channels</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div id="channels-list"></div>
+          <div class="gap-10"></div>
+          <button class="btn-ghost" id="channels-get-another">Get another channel</button>
+          <p class="center-note">The reserve is ~1% of channel capacity that stays locked while the channel is open — it comes back when it closes.</p>
+        </div>
+      </section>
+
+      <!-- ══════════ PEERS ══════════ -->
+      <section class="screen" id="screen-peers">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Peers</div>
+          <button class="iconbtn" id="btn-peer-add" aria-label="Connect a peer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
+        </div>
+        <div class="sub-body">
+          <div id="peer-list"></div>
+          <div class="gap-10"></div>
+          <button class="btn-primary" id="btn-peer-connect">Connect a peer</button>
+          <p class="center-note">Peers are nodes your wallet talks to directly. Your channel lives with a peer — it reconnects automatically.</p>
+        </div>
+      </section>
+
+      <!-- ══════════ CONNECT PEER ══════════ -->
+      <section class="screen" id="screen-peer-connect">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Connect a peer</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="field-label">Node address</div>
+          <textarea class="field mono" id="peer-conn" rows="3" placeholder="pubkey@host:port"></textarea>
+          <p class="center-note" style="text-align:left;padding:8px 2px">Paste the node's <b>pubkey@host:port</b>. Once connected, that node can open a channel to your wallet.</p>
+          <div class="gap-10"></div>
+          <button class="btn-primary" id="connect-peer">Connect</button>
+          <p class="msg" id="peer-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ APP CONNECTIONS ══════════ -->
+      <section class="screen" id="screen-appconns">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">App connections</div>
+          <button class="iconbtn" id="btn-appconn-add" aria-label="New connection"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
+        </div>
+        <div class="sub-body">
+          <div id="appconn-list"></div>
+          <div class="gap-10"></div>
+          <button class="btn-primary" id="btn-appconn-new">Create connection</button>
+          <p class="center-note">Apps connect over Nostr Wallet Connect to pay from this wallet — up to 10 connections.</p>
+          <p class="msg" id="appconn-list-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ NEW APP CONNECTION ══════════ -->
+      <section class="screen" id="screen-appconn-new">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">New connection</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div id="appconn-form">
+            <div class="field-label">App name</div>
+            <input class="field" id="appconn-name" placeholder="e.g. v4vmusic.com" />
+            <div class="field-label">Permissions</div>
+            <div class="chip-row chip-group" id="appconn-perms">
+              <button class="chip on" data-v="full">Full access</button>
+              <button class="chip" data-v="pay">Pay only</button>
+              <button class="chip" data-v="readonly">Read only</button>
+            </div>
+            <div id="appconn-limit-block">
+              <div class="field-label">Spending limit (sats, 0 = unlimited)</div>
+              <input class="field" id="appconn-limit" inputmode="numeric" value="10000" />
+              <div class="field-label">Limit renews</div>
+              <div class="chip-row chip-group" id="appconn-renew">
+                <button class="chip on" data-v="daily">Daily</button>
+                <button class="chip" data-v="weekly">Weekly</button>
+                <button class="chip" data-v="monthly">Monthly</button>
+                <button class="chip" data-v="never">Never</button>
+              </div>
+            </div>
+            <div class="field-label">Connection expires</div>
+            <div class="chip-row chip-group" id="appconn-expiry">
+              <button class="chip" data-v="7">1 week</button>
+              <button class="chip" data-v="30">1 month</button>
+              <button class="chip" data-v="365">1 year</button>
+              <button class="chip on" data-v="0">Never</button>
+            </div>
+            <div class="gap-18"></div>
+            <button class="btn-primary" id="appconn-create">Create</button>
+            <p class="center-note">Read only can't spend — it only sees balance and history.</p>
+          </div>
+          <div id="appconn-result" class="hidden">
+            <p class="center-note">Scan this from the app, or copy the pairing string.</p>
+            <div class="qr-wrap"><img id="appconn-qr" class="qr hidden" alt="Pairing QR" /></div>
+            <textarea id="appconn-uri" class="field mono" readonly rows="3"></textarea>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="appconn-copy">Copy pairing string</button>
+            <p class="center-note" style="color:#ffd479">Anyone with this string can spend up to your limit — treat it like cash. It can't be shown again.</p>
+            <div class="gap-10"></div>
+            <button class="btn-primary" id="appconn-done">Done</button>
+          </div>
+          <p class="msg" id="appconn-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ APP CONNECTION DETAIL ══════════ -->
+      <section class="screen" id="screen-appconn-detail">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title" id="acd-title">Connection</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="order-card">
+            <div class="order-row"><span>Permissions</span><b id="acd-perms">—</b></div>
+            <div class="order-row"><span>Spending limit</span><b id="acd-limit">—</b></div>
+            <div class="order-row"><span>Spent this period</span><b id="acd-spent">—</b></div>
+            <div class="order-row"><span>Created</span><b id="acd-created">—</b></div>
+            <div class="order-row"><span>Expires</span><b id="acd-expiry">—</b></div>
+          </div>
+          <p class="center-note">The pairing secret can't be shown again — if the app lost it, revoke this connection and create a new one.</p>
+          <div class="gap-10"></div>
+          <button class="btn-primary btn-danger" id="acd-revoke">Revoke connection</button>
+          <p class="msg" id="acd-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ CLOUD BACKUP ══════════ -->
+      <section class="screen" id="screen-backup">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Cloud backup</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="order-card">
+            <div class="order-row"><span>Google Drive</span><b id="backup-drive-state">—</b></div>
+            <div class="order-row"><span>Account</span><b id="backup-account">—</b></div>
+          </div>
+          <p class="center-note">Backups are encrypted with your wallet seed before they leave this device — Google can't read them. They sync automatically while the node runs.</p>
+          <div class="gap-10"></div>
+          <button class="btn-primary" id="drive-connect">Connect Drive</button>
+          <div class="gap-10"></div>
+          <button class="btn-ghost" id="drive-backup-now">Back up now</button>
+          <div class="gap-10"></div>
+          <button class="btn-ghost" id="export">Download backup file</button>
+          <label class="toggle-row" id="auto-download-row"><input type="checkbox" id="auto-download" /> Auto-download a backup file when the wallet changes (desktop)</label>
+          <details class="adv">
+            <summary>Delete cloud backup</summary>
+            <p class="center-note" style="text-align:left">Removes the encrypted backup from Google Drive. Requires the node stopped so auto-sync can't re-create it.</p>
+            <button class="btn-ghost" id="drive-delete">Delete Drive backup</button>
+          </details>
+          <p class="msg" id="backup-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ RECOVERY (seed + phrase) ══════════ -->
+      <section class="screen" id="screen-recovery">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Recovery</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <div class="field-label">Wallet seed · hex (copy/paste format)</div>
+          <button class="seed-hex masked" id="rec-hex"></button>
+          <div class="seed-hint" id="rec-hex-hint">Tap to reveal</div>
+          <div class="seed-actions"><button class="btn-ghost" id="rec-hex-copy">Copy seed</button></div>
+          <div class="field-label" style="margin-top:26px">Recovery phrase · 24 words (pen &amp; paper)</div>
+          <div class="seed-grid" id="rec-words"></div>
+          <div class="seed-hint">Tap a word to reveal it</div>
+          <div class="seed-actions">
+            <button class="btn-ghost" id="rec-words-reveal">Reveal all</button>
+            <button class="btn-ghost" id="rec-words-copy">Copy phrase</button>
+          </div>
+          <p class="center-note" style="margin-top:14px">Either form restores <b>this wallet only</b> — other wallet apps derive different keys from the same words.</p>
+          <p class="msg" id="phrase-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ RECOVERY ADDRESS (sweep) ══════════ -->
+      <section class="screen" id="screen-sweep">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Recovery address</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <p class="center-note" style="text-align:left;padding:4px 2px">If a channel ever force-closes, your funds return on-chain. They're swept automatically to this Bitcoin address — set it once and forget it.</p>
+          <div class="field-label">Bitcoin address</div>
+          <input class="field mono" id="sweep-address" autocomplete="off" placeholder="bc1q…" />
+          <div class="gap-18"></div>
+          <button class="btn-primary" id="save-sweep">Save</button>
+          <p class="msg" id="sweep-msg"></p>
+        </div>
+      </section>
+
+      <!-- ══════════ DEVELOPER SETTINGS ══════════ -->
+      <section class="screen" id="screen-dev">
+        <div class="topbar">
+          <button class="iconbtn back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <div class="title">Developer settings</div>
+          <span class="topbar-spacer"></span>
+        </div>
+        <div class="sub-body">
+          <p class="center-note">Defaults ship with the app — only change these if you run your own infrastructure. The node must be stopped to save.</p>
+          <div class="field-label">Network</div>
+          <select class="field" id="network">
+            <option value="mainnet">mainnet</option>
+            <option value="signet">signet</option>
+            <option value="testnet">testnet</option>
+            <option value="regtest">regtest</option>
+          </select>
+          <div class="field-label">Esplora URL</div>
+          <input class="field mono" id="esplora" placeholder="https://mempool.space/api" />
+          <div class="field-label">Bridge URL</div>
+          <input class="field mono" id="bridge" placeholder="wss://…" />
+          <div class="field-label">Gossip (RGS) URL</div>
+          <input class="field mono" id="rgs" placeholder="https://…" />
+          <div class="gap-10"></div>
+          <button class="btn-ghost" id="save-config">Save connection settings</button>
+          <p class="msg" id="config-msg"></p>
+          <details class="adv">
+            <summary>Google Drive OAuth client</summary>
+            <input class="field mono" id="google-client-id" placeholder="Google OAuth client id" />
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="save-drive">Save client id</button>
+            <p class="msg" id="drive-msg"></p>
+          </details>
+          <details class="adv">
+            <summary>Web Push (offline wake)</summary>
+            <div class="field-label">Push gateway URL</div>
+            <input class="field mono" id="push-gateway-url" value="https://nwc-push-gateway-production.up.railway.app" />
+            <div class="field-label">NWC relay URL</div>
+            <input class="field mono" id="push-relay-url" value="wss://relay.getalby.com/v1" />
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="push-enable">Enable offline wake</button>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="push-disable">Disable</button>
+            <p class="msg" id="push-msg"></p>
+          </details>
+          <details class="adv">
+            <summary>iOS background audio (keep-alive)</summary>
+            <p class="center-note">Plays a silent audio track so the OS keeps this wallet's node awake while the app is in the background — so boosts from other apps (NWC) can settle in real time instead of only when you reopen the wallet. Uses more battery, and it's best-effort: iOS and Android can still suspend it. On iOS, install to the Home Screen first; on Android, exempt this app from battery optimization.</p>
+            <label class="toggle-row"><input type="checkbox" id="keepalive-toggle" /> Play silent background audio to keep the node alive</label>
+            <p class="msg" id="keepalive-msg"></p>
+          </details>
+          <details class="adv">
+            <summary>Diagnostics</summary>
+            <p class="center-note">The app keeps a local, rolling log of its own activity (never uploaded anywhere). After a test run, <b>Copy</b> it to paste anywhere, or <b>Share</b> it to Telegram / Drive / AirDrop via the share sheet.</p>
+            <p class="msg" id="diag-stats"></p>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="diag-copy">Copy diagnostics</button>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="diag-export">Share diagnostics</button>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="diag-clear">Clear diagnostics</button>
+            <p class="msg" id="diag-msg"></p>
+          </details>
+          <details class="adv">
+            <summary>Force-close a channel (recovery)</summary>
+            <p class="center-note"><b>This cannot be undone.</b> Force-closing broadcasts this wallet's latest commitment and ends the channel. Use it only when the peer is gone for good — a normal close needs both sides online to sign. Your balance returns on-chain only after the channel's delay (usually about a day), and it needs a <b>recovery address</b> set, or there is nowhere to sweep it to.</p>
+            <div class="field-label">Channel</div>
+            <select class="field" id="fc-channel"></select>
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="fc-refresh">Refresh list</button>
+            <div class="gap-10"></div>
+            <div class="field-label">Type FORCE CLOSE to confirm</div>
+            <input class="field mono" id="fc-confirm" placeholder="FORCE CLOSE" autocapitalize="characters" />
+            <div class="gap-10"></div>
+            <button class="btn-ghost" id="fc-go">Force-close this channel</button>
+            <p class="msg" id="fc-msg"></p>
+          </details>
+        </div>
+      </section>
+
+      <!-- ══════════ settings drawer ══════════ -->
+      <div id="scrim"></div>
+      <aside id="drawer">
+        <div class="drawer-head">
+          <div class="logo logo-mark"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M13 3L4 14h6l-1 7 9-11h-6l1-7z"/></svg></div>
+          <div>
+            <div class="t1">Libre Wallet</div>
+            <div class="t2" id="drawer-status">—</div>
+          </div>
+        </div>
+        <div class="drawer-body">
+          <button class="d-item" id="d-home">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 9.5V21h14V9.5"/></svg>
+            <span class="grow">Wallet</span>
+          </button>
+          <div class="d-section">Node</div>
+          <button class="d-item" id="d-node">
+            <span class="node-dot off" id="node-dot"></span>
+            <span class="grow">Lightning node</span>
+            <span class="val" id="d-node-val">—</span>
+          </button>
+          <button class="d-item" id="d-channels">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 3L4 14h6l-1 7 9-11h-6l1-7z"/></svg>
+            <span class="grow">Channels</span>
+            <span class="val" id="d-channels-val"></span>
+          </button>
+          <button class="d-item" id="d-peers">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M7.8 7.8l2.8 7.4M16.2 7.8l-2.8 7.4M8.6 6h6.8"/></svg>
+            <span class="grow">Peers</span>
+            <span class="val" id="d-peers-val"></span>
+          </button>
+          <button class="d-item" id="d-getchannel">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            <span class="grow">Get a channel</span>
+            <span class="val">LSP</span>
+          </button>
+
+          <div class="d-section" id="d-section-apps">Apps</div>
+          <button class="d-item" id="d-appconns">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12a3 3 0 106 0 3 3 0 00-6 0zM3 12h3m12 0h3"/></svg>
+            <span class="grow">App connections</span>
+            <span class="val" id="d-appconns-val"></span>
+          </button>
+
+          <div class="d-section">Backup &amp; security</div>
+          <button class="d-item" id="d-backup">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 19a4 4 0 01-.5-7.97A6 6 0 0117.4 9.6 4.5 4.5 0 0117.5 19H6z"/></svg>
+            <span class="grow">Cloud backup</span>
+            <span class="val" id="d-backup-val"></span>
+          </button>
+          <button class="d-item" id="d-recovery">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 118 0v3"/></svg>
+            <span class="grow">Recovery phrase</span>
+          </button>
+          <button class="d-item" id="d-sweep">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l5-5m0 0V9a5 5 0 015-5h6v6a5 5 0 01-5 5H9z"/></svg>
+            <span class="grow">Recovery address</span>
+          </button>
+          <button class="d-item" id="d-restore">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 108-8M4 4v5h5"/></svg>
+            <span class="grow">Restore from backup</span>
+          </button>
+
+          <div class="d-section">Advanced</div>
+          <button class="d-item" id="d-dev">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4h4l.6 2.6a7 7 0 012 1.2L19 7l2 3.4-2 1.7a7.2 7.2 0 010 2.3l2 1.7-2 3.4-2.4-.8a7 7 0 01-2 1.2L14 22h-4l-.6-2.6a7 7 0 01-2-1.2L5 19l-2-3.4 2-1.7a7.2 7.2 0 010-2.3L3 9.9 5 6.5l2.4.8a7 7 0 012-1.2L10 4z"/><circle cx="12" cy="13" r="3"/></svg>
+            <span class="grow">Developer settings</span>
+          </button>
+          <button class="d-item hidden" id="d-exit-demo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h4v16h-4M10 17l5-5-5-5M15 12H3"/></svg>
+            <span class="grow">Exit demo mode</span>
+          </button>
+          <button class="d-item danger" id="d-delete">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14m-9-3h4M7 7l1 13h8l1-13"/></svg>
+            <span class="grow">Delete all wallet data</span>
+          </button>
+          <button class="d-item hidden" id="install-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10m0 0l-4-4m4 4l4-4M5 20h14"/></svg>
+            <span class="grow">Install app</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- ══════════ transactions sheet ══════════ -->
+      <div id="sheet">
+        <div class="sheet-grip"></div>
+        <div class="sheet-head">
+          <h2>Transactions</h2>
+          <button class="iconbtn" id="btn-sheet-close" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+        </div>
+        <div class="txlist" id="txlist"><p class="center-note" id="tx-empty">No transactions yet.</p></div>
+      </div>
+
+      <div id="demo-badge" class="hidden">DEMO</div>
+
+      <!-- ══════════ onboarding host (full-screen hard gate) ══════════ -->
+      <section id="onboarding" class="hidden">
+        <div class="ob-progress" id="ob-progress"></div>
+        <div class="ob-body" id="ob-body"></div>
+        <div class="ob-foot" id="ob-foot"></div>
+      </section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

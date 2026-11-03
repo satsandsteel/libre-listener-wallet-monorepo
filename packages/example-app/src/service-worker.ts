@@ -1,4 +1,7 @@
 import { LibreListenerWallet, IndexedDBStorageProvider } from "@libre/listener-wallet";
+import { bridgeTargetUrl, isNodeAlreadyRunningError, acquireWebNodeLock, nodeLockName } from "@libre/shared";
+import { dbNameForNetwork, META_DB_NAME, ACTIVE_NETWORK_KEY } from "./core/storage-namespace";
+import { resolveSwConfig } from "./core/sw-config";
 
 declare const self: any;
 
@@ -30,27 +33,30 @@ async function handlePushEvent(payload: { walletPubkey: string; relayUrl: string
 
   console.log("[SW] Offline state. Booting LDK Node in background Service Worker...");
 
-  // 2. Fetch configurations from storage
-  const storage = new IndexedDBStorageProvider();
+  // 2. Fetch configurations from storage — read the active network from the meta DB
+  // so we open the correct network-scoped DB (e.g. libre-wallet-mainnet) rather than
+  // the legacy default (libre-wallet).
+  const metaStore = new IndexedDBStorageProvider(META_DB_NAME);
+  const activeNetwork = (await metaStore.getItem(ACTIVE_NETWORK_KEY)) || "regtest";
+  const storage = new IndexedDBStorageProvider(dbNameForNetwork(activeNetwork));
 
-  // Read config from IndexedDB if saved
-  let configJson = await storage.getItem("ldk_config");
-  let config = {
-    network: "regtest" as const,
-    esploraUrl: "http://127.0.0.1:3002",
-  };
-  if (configJson) {
-    try {
-      config = JSON.parse(configJson);
-    } catch (e) {}
+  // Read config the main app persisted (the SW has no DOM). No localhost defaults —
+  // a deployed SW must use the real remote esplora + bridge from config.
+  const config = resolveSwConfig(await storage.getItem("ldk_config"));
+  if (!config.esploraUrl) {
+    console.error("[SW] No esploraUrl in ldk_config — cannot boot node on push; aborting.");
+    return;
   }
 
   // Create a minimal WebSocket connection provider that uses browser WebSockets inside SW
   const socketProvider = {
     connect: async (host: string, port: number) => {
-      const wsUrl = "ws://127.0.0.1:8081";
+      const wsUrl = config.bridgeUrl;
+      if (!wsUrl) {
+        throw new Error("[SW] No bridgeUrl in ldk_config — cannot connect to peer on push.");
+      }
       console.log(`[SW] SW Connecting WebSocket bridge to ${wsUrl}...`);
-      const socket = new WebSocket(wsUrl);
+      const socket = new WebSocket(bridgeTargetUrl(wsUrl, host, port));
       socket.binaryType = "arraybuffer";
 
       const conn = {
@@ -92,15 +98,21 @@ async function handlePushEvent(payload: { walletPubkey: string; relayUrl: string
   };
 
   const wallet = new LibreListenerWallet({
-    config,
+    config: {
+      network: config.network as "mainnet" | "testnet" | "regtest" | "signet",
+      esploraUrl: config.esploraUrl,
+    },
     storage,
     socketProvider,
-    wasmUrl: "/liblightningjs.wasm",
+    wasmUrl: "./liblightningjs.wasm",
     logger: {
       info: (msg, ...args) => console.log("[SW LDK INFO]", msg, ...args),
       warn: (msg, ...args) => console.warn("[SW LDK WARN]", msg, ...args),
       error: (msg, ...args) => console.error("[SW LDK ERROR]", msg, ...args),
-    }
+    },
+    // Per-origin single-node lock: if the page's tab holds the node, the SW must not build a second
+    // node over the same storage — it should quietly skip offline processing instead.
+    acquireRunLock: () => acquireWebNodeLock(nodeLockName(dbNameForNetwork(activeNetwork))),
   });
 
   let processed = false;
@@ -126,6 +138,10 @@ async function handlePushEvent(payload: { walletPubkey: string; relayUrl: string
     ]);
 
   } catch (err: any) {
+    if (isNodeAlreadyRunningError(err)) {
+      console.log("[SW] App is open (holds the node lock) — skipping offline processing.");
+      return; // page owns the node; do NOT show a fallback notification
+    }
     console.error("[SW] Error during offline payment processing:", err.message || err);
   } finally {
     console.log("[SW] Stopping background wallet node...");

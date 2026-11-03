@@ -1,0 +1,162 @@
+name: Update wallet-embed "latest" download
+
+# Publishes the packed tarball twice on every push to master, under one release:
+#
+#   .../releases/download/wallet-embed-latest/libre-wallet-embed.tgz            (rolling)
+#   .../releases/download/wallet-embed-latest/libre-wallet-embed-<sha>.tgz      (immutable)
+#
+# Use the IMMUTABLE url in any app with a lockfile. npm records an integrity hash per resolved
+# url, so a rolling url whose bytes change under a pinned hash fails `npm ci` with EINTEGRITY —
+# i.e. a push here would redden an untouched consumer's production deploy. Pinning the <sha> url
+# makes upgrades an explicit, reviewable bump. The rolling url stays for demos/scripts and for
+# anyone who genuinely wants "newest, unpinned".
+#
+# The tarball is self-contained (tsup noExternal bundles all workspace deps + LDK, dts.resolve
+# inlines their types, and scripts/copy-wasm.mjs ships liblightningjs.wasm inside dist/), so a
+# consumer just does `npm i <that URL>` and copies dist/liblightningjs.wasm into their static
+# dir — see docs/embed-integration.md.
+#
+# NOTE: this rolling release is intentionally NOT marked --latest — the extension's
+# browser-extension-latest release owns the repo's single "latest" slot. This one is reached by
+# its fixed tag `wallet-embed-latest` only.
+#
+# Same build + gates as ci.yml — an unverified tarball is never published.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "packages/wallet-embed/**"
+      - "packages/wallet-core/**"
+      - "packages/libre-listener-wallet/**"
+      - "packages/shared/**"
+      - ".github/workflows/release-wallet-embed-latest.yml"
+  workflow_dispatch:
+
+# Default the workflow token to read-only; the job elevates to write to update the release.
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight build of the same rolling asset.
+concurrency:
+  group: wallet-embed-latest
+  cancel-in-progress: true
+
+jobs:
+  rolling:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # update the rolling release / replace its asset
+    steps:
+      # Third-party actions pinned to a full commit SHA (supply-chain safety); the
+      # trailing comment records the human-readable version.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10.10.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Workspace deps FIRST (turbo order: shared → SDK → wallet-core → wallet-embed). The embed's
+      # build (tsup + copy-wasm) and typecheck resolve @libre/* types from their dist/.
+      - name: Build workspace
+        run: pnpm build
+
+      # Never ship an unverified tarball: gate on lint, storage contract, typecheck, tests.
+      - name: Lint
+        run: pnpm --filter @libre/wallet-embed lint
+      - name: Storage-contract guard
+        run: pnpm check:storage
+      - name: Typecheck
+        run: pnpm --filter @libre/wallet-embed typecheck
+      - name: Unit tests
+        run: pnpm --filter @libre/wallet-embed test
+
+      # Pack to a STABLE filename so the download URL never changes. pnpm pack names the file with
+      # the package version (libre-wallet-embed-<ver>.tgz); rename it to the fixed asset name.
+      - name: Pack tarball
+        run: |
+          cd packages/wallet-embed
+          FILE=$(pnpm pack | tail -n1)
+          mv "$FILE" "$GITHUB_WORKSPACE/libre-wallet-embed.tgz"
+          echo "Packed $FILE -> libre-wallet-embed.tgz"
+
+      # THE release gate: be the consumer. Everything above this runs inside the workspace, where
+      # @libre/* resolve as symlinks and the bare specifiers in the packed artifact are invisible.
+      # This step installs the tarball the way an embedding app does — clean cache, empty project,
+      # no workspace — which is the only thing that catches an unresolvable @libre/* specifier
+      # escaping into either the manifest (npm i 404s) or the .d.ts (their typecheck breaks).
+      # Both have shipped before; a "packed manifest has no dependencies" assertion would have
+      # caught neither, and would false-positive on a future legitimate runtime dep.
+      - name: Consumer install contract
+        run: |
+          set -euo pipefail
+          D=$(mktemp -d)
+          cd "$D"
+          npm init -y >/dev/null
+          npm install --cache "$D/.npm-clean" "$GITHUB_WORKSPACE/libre-wallet-embed.tgz"
+          test -f node_modules/@libre/wallet-embed/dist/liblightningjs.wasm
+          # No unpublished workspace package may be pulled in as a transitive dep.
+          test "$(ls node_modules/@libre)" = "wallet-embed"
+          # Resolve, don't execute: this is a browser build (it subclasses HTMLElement at module
+          # scope), so require()-ing it under Node throws for reasons unrelated to packaging.
+          node -e "require.resolve('@libre/wallet-embed')"
+          # Types must resolve standalone too — dist/*.d.ts must not reference unpublished @libre/*.
+          cat > probe.ts <<'EOF'
+          import { mountLibreWallet, type MountHandle } from "@libre/wallet-embed";
+          const h: MountHandle = mountLibreWallet(document.createElement("div"), {
+            googleClientId: "x", wasmUrl: "/liblightningjs.wasm",
+          });
+          void h.webln; void h.installedWebln; void h.state().view;
+          EOF
+          npx -y -p typescript@5 tsc --noEmit --strict --skipLibCheck false \
+            --module esnext --moduleResolution bundler --target es2022 --lib es2022,dom probe.ts
+          echo "Consumer install contract OK"
+
+      # Upsert the single rolling release, carrying BOTH assets: the rolling filename (replaced in
+      # place with --clobber, so its download URL never changes) and an immutable per-commit copy
+      # (never clobbered — a lockfile can pin it). NOT --latest (the extension release owns that
+      # slot). Old per-commit assets are pruned so the release doesn't grow without bound.
+      - name: Update rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=wallet-embed-latest
+          KEEP=10
+          PINNED="libre-wallet-embed-${GITHUB_SHA}.tgz"
+          cp libre-wallet-embed.tgz "$PINNED"
+          NOTES="Rolling build of @libre/wallet-embed — auto-updated on every push to master (commit ${GITHUB_SHA}).
+
+          **Install — pinned (use this in any app with a lockfile):**
+          \`\`\`
+          npm i https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${PINNED}
+          cp node_modules/@libre/wallet-embed/dist/liblightningjs.wasm public/
+          \`\`\`
+
+          **Install — rolling (always newest; bytes change under a fixed URL):**
+          \`\`\`
+          npm i https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/libre-wallet-embed.tgz
+          \`\`\`
+          npm pins an integrity hash per resolved URL, so the rolling URL breaks \\\`npm ci\\\` with EINTEGRITY the next time this workflow runs. Pin the per-commit URL and bump it deliberately. The last ${KEEP} pinned builds are retained.
+
+          Integration + per-origin Google OAuth setup: docs/embed-integration.md."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" libre-wallet-embed.tgz "$PINNED" --clobber
+            gh release edit "$TAG" --title "Latest wallet-embed build (auto-updated)" --notes "$NOTES"
+          else
+            gh release create "$TAG" libre-wallet-embed.tgz "$PINNED" \
+              --title "Latest wallet-embed build (auto-updated)" --notes "$NOTES" --prerelease
+          fi
+
+          # Prune all but the newest $KEEP per-commit assets (the rolling one is never matched).
+          gh release view "$TAG" --json assets \
+            --jq '.assets | map(select(.name | test("^libre-wallet-embed-[0-9a-f]{40}\\.tgz$")))
+                  | sort_by(.createdAt) | reverse | .['"$KEEP"':] | .[].name' \
+            | while read -r old; do
+                [ -n "$old" ] || continue
+                echo "Pruning old pinned asset: $old"
+                gh release delete-asset "$TAG" "$old" --yes
+              done
